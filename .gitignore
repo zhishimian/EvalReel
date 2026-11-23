@@ -1,0 +1,9 @@
+*.exe
+/evalreel
+traces/
+*.jsonl.gz
+.env
+configs/*.local.yaml
+.idea/
+*.out
+*.test

@@ -1,0 +1,29 @@
+server:
+  listen: "127.0.0.1:8080"
+  pprof_listen: "127.0.0.1:6060" # 仅监听本机用于内存与协程分析，留空可关闭
+  shutdown_timeout: "15s"        # 收到退出信号后等待在途请求完成落盘的时间
+
+upstream:
+  base_url: "http://127.0.0.1:9090" # 本地可先指向 mockllm，真实测试时改为模型服务地址
+  timeout: "120s"                   # 等待上游返回响应头的最大时间
+
+recorder:
+  output_dir: "./traces"         # 轨迹压缩文件输出目录
+  session_id: ""                 # 留空时自动按时间戳生成
+  max_request_body_mb: 10        # 读取请求体的最大大小限制（MB）
+
+chaos:
+  enabled: false                 # 改为 true 即按下方规则注入故障
+  rules:
+    - name: "every_2nd_rate_limit"
+      match_path: "/v1/chat/completions"
+      every_n: 2                 # 每第 2 次匹配请求返回一次 429
+      probability: 0.0
+      action: "status_429"
+      retry_after_sec: 2
+    - name: "cut_after_5_chunks"
+      match_path: "/v1/chat/completions"
+      every_n: 0
+      probability: 0.0
+      action: "cut_stream"
+      cut_after_chunks: 5        # 流式输出 5 个块后强行断开
