@@ -348,7 +348,8 @@ func (p *Processor) publishProgressAndTryFinalize(ctx context.Context, runID, la
 		p.logger.Warn("load run for report failed", "run_id", runID, "err", err)
 		return
 	}
-	summary := report.Aggregate(run, tasks, scores)
+	spansByTrace := loadSpansByTrace(ctx, p.store, tasks)
+	summary := report.AggregateWithSpans(run, tasks, scores, spansByTrace)
 	htmlStr, err := report.RenderHTML(summary)
 	if err != nil {
 		p.logger.Warn("render report failed", "run_id", runID, "err", err)
@@ -416,4 +417,23 @@ func findTarget(targets []config.TargetConfig, name string) (config.TargetConfig
 		}
 	}
 	return config.TargetConfig{}, false
+}
+
+func loadSpansByTrace(ctx context.Context, st store.Store, tasks []store.EvalTask) map[string][]store.TraceSpan {
+	out := make(map[string][]store.TraceSpan)
+	for _, tk := range tasks {
+		if tk.TraceID == "" {
+			continue
+		}
+		if _, seen := out[tk.TraceID]; seen {
+			continue
+		}
+		spans, err := st.ListSpansByTraceID(ctx, tk.TraceID)
+		if err == nil && len(spans) > 0 {
+			out[tk.TraceID] = spans
+		} else {
+			out[tk.TraceID] = nil
+		}
+	}
+	return out
 }

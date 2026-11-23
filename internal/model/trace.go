@@ -44,6 +44,9 @@ type ChaosInfo struct {
 // TraceRecord 是落盘到 .jsonl.gz 文件中的单条完整调用轨迹。
 type TraceRecord struct {
 	TraceID       string          `json:"trace_id"`
+	SpanID        string          `json:"span_id,omitempty"`
+	ParentSpanID  string          `json:"parent_span_id,omitempty"`
+	AgentName     string          `json:"agent_name,omitempty"`
 	SessionID     string          `json:"session_id"`
 	Timestamp     time.Time       `json:"timestamp"`
 	Method        string          `json:"method"`

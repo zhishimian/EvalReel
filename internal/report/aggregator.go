@@ -53,19 +53,30 @@ type ItemComparison struct {
 
 // ItemTargetResult 保存某个目标在单道题（含多次重复）上的汇总输出与评判理由。
 type ItemTargetResult struct {
-	TargetName   string `json:"target_name"`
-	PassCount    int    `json:"pass_count"`
-	TrialCount   int    `json:"trial_count"`
-	PassedAll    bool   `json:"passed_all"`
-	PassedAny    bool   `json:"passed_any"`
-	SampleOutput string `json:"sample_output"`
-	SampleTools  string `json:"sample_tools"`
-	SampleReason string `json:"sample_reason"`
-	AvgTotalMs   int64  `json:"avg_total_ms"`
+	TargetName   string     `json:"target_name"`
+	PassCount    int        `json:"pass_count"`
+	TrialCount   int        `json:"trial_count"`
+	PassedAll    bool       `json:"passed_all"`
+	PassedAny    bool       `json:"passed_any"`
+	SampleOutput string     `json:"sample_output"`
+	SampleTools  string     `json:"sample_tools"`
+	SampleReason string     `json:"sample_reason"`
+	AvgTotalMs   int64      `json:"avg_total_ms"`
+	CallTree     []SpanNode `json:"call_tree,omitempty"`
 }
 
 // Aggregate 根据数据库落盘的子任务与评判得分，算出准确率、pass@k、pass^k、分位延迟与差异明细。
 func Aggregate(run *store.EvalRun, tasks []store.EvalTask, scores []store.EvalScore) Summary {
+	return AggregateWithSpans(run, tasks, scores, nil)
+}
+
+// AggregateWithSpans 在汇总基础指标的同时，根据 trace_id 关联的调用节点组装多 Agent 瀑布调用树。
+func AggregateWithSpans(
+	run *store.EvalRun,
+	tasks []store.EvalTask,
+	scores []store.EvalScore,
+	spansByTrace map[string][]store.TraceSpan,
+) Summary {
 	scoresByTask := make(map[string][]store.EvalScore)
 	for _, sc := range scores {
 		scoresByTask[sc.TaskID] = append(scoresByTask[sc.TaskID], sc)
@@ -203,6 +214,9 @@ func Aggregate(run *store.EvalRun, tasks []store.EvalTask, scores []store.EvalSc
 					res.SampleOutput = truncateStr(tk.ResponseText, 240)
 					res.SampleTools = formatToolsCompact(tk.ToolCallsJSON)
 					res.SampleReason = taskReasonMap[tk.ID]
+					if tk.TraceID != "" && len(spansByTrace) > 0 {
+						res.CallTree = BuildCallTree(spansByTrace[tk.TraceID])
+					}
 				}
 			}
 			if res.TrialCount > 0 {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"evalreel/internal/config"
+	"evalreel/internal/observability"
 )
 
 // AgentRunner 为每次运行分配独立临时目录，拉起外部 Agent 子进程并在超时时强杀进程树。
@@ -53,6 +54,9 @@ func (r *AgentRunner) Execute(ctx context.Context, target config.TargetConfig, i
 	}
 	cmd.WaitDelay = 2 * time.Second
 
+	traceID := observability.NewTraceID()
+	rootSpanID := observability.NewSpanID()
+
 	env := append([]string(nil), os.Environ()...)
 	apiKey := target.APIKey
 	if apiKey == "" && target.APIKeyEnv != "" {
@@ -67,6 +71,11 @@ func (r *AgentRunner) Execute(ctx context.Context, target config.TargetConfig, i
 	if target.Model != "" {
 		env = append(env, "OPENAI_MODEL="+target.Model)
 	}
+	env = append(env,
+		"TRACEPARENT="+observability.FormatTraceparent(traceID, rootSpanID),
+		"EVALREEL_TRACE_ID="+traceID,
+		"EVALREEL_ROOT_SPAN_ID="+rootSpanID,
+	)
 	cmd.Env = env
 
 	var stdoutBuf, stderrBuf bytes.Buffer
@@ -81,14 +90,15 @@ func (r *AgentRunner) Execute(ctx context.Context, target config.TargetConfig, i
 	if err != nil {
 		errDetail := strings.TrimSpace(stderrBuf.String())
 		if errDetail != "" {
-			return RunOutput{ResponseText: outText, TotalMs: elapsedMs, WorkDir: workDir},
+			return RunOutput{TraceID: traceID, ResponseText: outText, TotalMs: elapsedMs, WorkDir: workDir},
 				fmt.Errorf("agent failed (%v): %s", err, errDetail)
 		}
-		return RunOutput{ResponseText: outText, TotalMs: elapsedMs, WorkDir: workDir},
+		return RunOutput{TraceID: traceID, ResponseText: outText, TotalMs: elapsedMs, WorkDir: workDir},
 			fmt.Errorf("agent failed: %w", err)
 	}
 
 	return RunOutput{
+		TraceID:      traceID,
 		ResponseText: outText,
 		FinishReason: "stop",
 		TotalMs:      elapsedMs,

@@ -33,6 +33,13 @@ const reportHTMLTemplate = `<!DOCTYPE html>
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; color: #374151; }
   .muted { color: #6b7280; font-size: 12px; }
   .hidden { display: none; }
+  details.tree-box { margin-top: 8px; border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px 8px; background: #f9fafb; }
+  details.tree-box summary { cursor: pointer; font-size: 12px; font-weight: 600; color: #1d4ed8; }
+  .tree-row { margin-top: 6px; font-size: 12px; }
+  .tree-label { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .wf-track { position: relative; height: 8px; background: #e5e7eb; border-radius: 4px; margin-top: 2px; overflow: hidden; }
+  .wf-bar { position: absolute; top: 0; height: 8px; background: #2563eb; border-radius: 4px; }
+  .wf-bar-err { background: #dc2626; }
 </style>
 </head>
 <body>
@@ -123,6 +130,20 @@ const reportHTMLTemplate = `<!DOCTYPE html>
             {{if .SampleTools}}<div class="mono">工具: {{.SampleTools}}</div>{{end}}
             {{if .SampleOutput}}<div class="mono">输出: {{.SampleOutput}}</div>{{end}}
             {{if .SampleReason}}<div class="muted">评判: {{.SampleReason}}</div>{{end}}
+            {{if .CallTree}}
+            <details class="tree-box">
+              <summary>调用层级树 ({{len .CallTree}} 跳)</summary>
+              {{range .CallTree}}
+              <div class="tree-row" style="{{indentStyle .Depth}}">
+                <div class="tree-label">
+                  <span><strong>{{.AgentName}}</strong> <span class="muted">({{.Model}})</span></span>
+                  <span class="muted">+{{.OffsetMs}}ms | {{.DurationMs}}ms | {{.InputTokens}}/{{.OutputTokens}} tok</span>
+                </div>
+                <div class="wf-track"><div class="wf-bar {{if ne .Status "ok"}}wf-bar-err{{end}}" style="{{barStyle .LeftPct .WidthPct}}"></div></div>
+              </div>
+              {{end}}
+            </details>
+            {{end}}
           </td>
           {{end}}
         </tr>
@@ -173,7 +194,15 @@ type htmlView struct {
 
 // RenderHTML 生成不依赖任何外部网络脚本的独立单文件 report.html 字符串。
 func RenderHTML(summary Summary) (string, error) {
-	tmpl, err := template.New("report").Parse(reportHTMLTemplate)
+	funcs := template.FuncMap{
+		"indentStyle": func(depth int) template.CSS {
+			return template.CSS(fmt.Sprintf("padding-left:%dpx", depth*14))
+		},
+		"barStyle": func(left, width float64) template.CSS {
+			return template.CSS(fmt.Sprintf("left:%.1f%%;width:%.1f%%", left, width))
+		},
+	}
+	tmpl, err := template.New("report").Funcs(funcs).Parse(reportHTMLTemplate)
 	if err != nil {
 		return "", fmt.Errorf("parse html template: %w", err)
 	}

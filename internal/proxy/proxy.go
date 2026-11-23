@@ -22,6 +22,9 @@ import (
 	"evalreel/internal/observability"
 	"evalreel/internal/recorder"
 	"evalreel/internal/sse"
+	"evalreel/internal/store"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const defaultMaxBodyBytes = 10 * 1024 * 1024
@@ -30,6 +33,11 @@ type metaCtxKey struct{}
 
 type requestMeta struct {
 	traceID      string
+	spanID       string
+	parentSpanID string
+	agentName    string
+	runID        string
+	taskID       string
 	startTime    time.Time
 	method       string
 	path         string
@@ -38,19 +46,26 @@ type requestMeta struct {
 	requestText  string
 	isChatPath   bool
 	chaosInfo    *model.ChaosInfo
+	otelSpan     trace.Span
 	recorded     atomic.Bool
 }
 
-// Options 配置反向代理的上游目标、会话信息、落盘器与混沌引擎。
+// SpanWriter 定义将代理捕获的父子调用节点持久化到数据库的能力。
+type SpanWriter interface {
+	SaveSpans(ctx context.Context, spans []store.TraceSpan) error
+}
+
+// Options 配置反向代理的上游目标、会话信息、落盘器、Span 存储与混沌引擎。
 type Options struct {
-	UpstreamURL       string
-	UpstreamTimeout   time.Duration
-	SessionID         string
-	MaxRequestBodyMB  int
-	Recorder          recorder.Recorder
-	Chaos             *chaos.Engine
-	EstimateTokens    func(string) int
-	Logger            *slog.Logger
+	UpstreamURL      string
+	UpstreamTimeout  time.Duration
+	SessionID        string
+	MaxRequestBodyMB int
+	Recorder         recorder.Recorder
+	SpanStore        SpanWriter
+	Chaos            *chaos.Engine
+	EstimateTokens   func(string) int
+	Logger           *slog.Logger
 }
 
 // Proxy 封装了兼容 OpenAI 流式透传、旁路录制与混沌故障注入的反向代理。
@@ -143,6 +158,9 @@ func (p *Proxy) Handler() http.Handler {
 				}
 				rec := model.TraceRecord{
 					TraceID:      meta.traceID,
+					SpanID:       meta.spanID,
+					ParentSpanID: meta.parentSpanID,
+					AgentName:    meta.agentName,
 					SessionID:    p.opts.SessionID,
 					Timestamp:    meta.startTime.UTC(),
 					Method:       meta.method,
@@ -160,7 +178,7 @@ func (p *Proxy) Handler() http.Handler {
 						FaultType: rule.Action,
 					},
 				}
-				p.writeRecord(rec)
+				p.writeRecord(meta, rec)
 			},
 		)
 	}
@@ -176,12 +194,33 @@ func (p *Proxy) CloseIdleConnections() {
 
 func (p *Proxy) captureMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		spanID := observability.NewSpanID()
+		var traceID, parentSpanID string
+		if tc, ok := observability.ParseTraceparent(r.Header.Get("traceparent")); ok {
+			traceID = tc.TraceID
+			parentSpanID = tc.SpanID
+			ctx = observability.ContextWithParent(ctx, tc)
+		} else {
+			traceID = observability.NewTraceID()
+		}
+
+		agentName := strings.TrimSpace(r.Header.Get("X-EvalReel-Agent-Name"))
+		runID := strings.TrimSpace(r.Header.Get("X-EvalReel-Run-ID"))
+		taskID := strings.TrimSpace(r.Header.Get("X-EvalReel-Task-ID"))
+		isChatPath := strings.HasSuffix(r.URL.Path, "/chat/completions")
+
 		meta := &requestMeta{
-			traceID:    fmt.Sprintf("tr-%d-%d", time.Now().UnixNano(), p.traceSeq.Add(1)),
-			startTime:  time.Now(),
-			method:     r.Method,
-			path:       r.URL.Path,
-			isChatPath: strings.HasSuffix(r.URL.Path, "/chat/completions"),
+			traceID:      traceID,
+			spanID:       spanID,
+			parentSpanID: parentSpanID,
+			agentName:    agentName,
+			runID:        runID,
+			taskID:       taskID,
+			startTime:    time.Now(),
+			method:       r.Method,
+			path:         r.URL.Path,
+			isChatPath:   isChatPath,
 		}
 
 		if r.Body != nil && r.Method == http.MethodPost {
@@ -197,7 +236,21 @@ func (p *Proxy) captureMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		ctx := context.WithValue(r.Context(), metaCtxKey{}, meta)
+		if isChatPath {
+			w.Header().Set("X-EvalReel-Span-ID", spanID)
+			w.Header().Set("X-EvalReel-Trace-ID", traceID)
+			var otelSpan trace.Span
+			ctx, otelSpan = observability.StartGenAISpan(ctx, "evalreel.proxy.chat", observability.GenAIAttrs{
+				System:       "openai",
+				RequestModel: meta.requestModel,
+				RunID:        runID,
+				TaskID:       taskID,
+				AgentName:    agentName,
+			})
+			meta.otelSpan = otelSpan
+		}
+
+		ctx = context.WithValue(ctx, metaCtxKey{}, meta)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -261,6 +314,9 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 			}
 			rec := model.TraceRecord{
 				TraceID:       meta.traceID,
+				SpanID:        meta.spanID,
+				ParentSpanID:  meta.parentSpanID,
+				AgentName:     meta.agentName,
 				SessionID:     p.opts.SessionID,
 				Timestamp:     meta.startTime.UTC(),
 				Method:        meta.method,
@@ -278,7 +334,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 				Metrics:       res.Metrics,
 				Chaos:         meta.chaosInfo,
 			}
-			p.writeRecord(rec)
+			p.writeRecord(meta, rec)
 		})
 		return nil
 	}
@@ -295,7 +351,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 
 	if meta.recorded.CompareAndSwap(false, true) {
 		rec := p.buildNonStreamRecord(meta, resp.StatusCode, respBytes)
-		p.writeRecord(rec)
+		p.writeRecord(meta, rec)
 	}
 	return nil
 }
@@ -311,8 +367,11 @@ func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 				status = model.StatusAborted
 				code = 499
 			}
-			p.writeRecord(model.TraceRecord{
+			p.writeRecord(meta, model.TraceRecord{
 				TraceID:      meta.traceID,
+				SpanID:       meta.spanID,
+				ParentSpanID: meta.parentSpanID,
+				AgentName:    meta.agentName,
 				SessionID:    p.opts.SessionID,
 				Timestamp:    meta.startTime.UTC(),
 				Method:       meta.method,
@@ -350,6 +409,9 @@ func (p *Proxy) buildNonStreamRecord(meta *requestMeta, statusCode int, respByte
 	totalMs := time.Since(meta.startTime).Milliseconds()
 	rec := model.TraceRecord{
 		TraceID:      meta.traceID,
+		SpanID:       meta.spanID,
+		ParentSpanID: meta.parentSpanID,
+		AgentName:    meta.agentName,
 		SessionID:    p.opts.SessionID,
 		Timestamp:    meta.startTime.UTC(),
 		Method:       meta.method,
@@ -422,7 +484,7 @@ func (p *Proxy) buildNonStreamRecord(meta *requestMeta, statusCode int, respByte
 	return rec
 }
 
-func (p *Proxy) writeRecord(rec model.TraceRecord) {
+func (p *Proxy) writeRecord(meta *requestMeta, rec model.TraceRecord) {
 	m := observability.DefaultMetrics()
 	chaosRule := ""
 	if rec.Chaos != nil {
@@ -431,6 +493,54 @@ func (p *Proxy) writeRecord(rec model.TraceRecord) {
 	m.RecordProxyRequest(rec.RequestModel, string(rec.Status), chaosRule)
 	m.ObserveTTFT("proxy", rec.RequestModel, "reasoning", rec.Metrics.TTFTReasoningMs)
 	m.ObserveTTFT("proxy", rec.RequestModel, "answer", rec.Metrics.TTFTAnswerMs)
+
+	if meta != nil && meta.otelSpan != nil {
+		var spanErr error
+		if rec.RawError != "" {
+			spanErr = errors.New(rec.RawError)
+		}
+		observability.EndGenAISpan(meta.otelSpan, observability.GenAIResult{
+			ResponseModel: rec.ResponseModel,
+			InputTokens:   rec.Metrics.InputTokens,
+			OutputTokens:  rec.Metrics.OutputTokens,
+			FinishReason:  rec.FinishReason,
+			Status:        string(rec.Status),
+			Err:           spanErr,
+		})
+	}
+
+	if p.opts.SpanStore != nil && meta != nil && meta.spanID != "" {
+		ttftMs := rec.Metrics.TTFTAnswerMs
+		if ttftMs == 0 {
+			ttftMs = rec.Metrics.TTFTReasoningMs
+		}
+		modelName := rec.ResponseModel
+		if modelName == "" {
+			modelName = rec.RequestModel
+		}
+		saveCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := p.opts.SpanStore.SaveSpans(saveCtx, []store.TraceSpan{{
+			SpanID:       meta.spanID,
+			ParentSpanID: meta.parentSpanID,
+			TraceID:      rec.TraceID,
+			RunID:        meta.runID,
+			TaskID:       meta.taskID,
+			AgentName:    meta.agentName,
+			Operation:    "llm_chat",
+			Model:        modelName,
+			StartTimeMs:  meta.startTime.UnixMilli(),
+			DurationMs:   rec.Metrics.TotalMs,
+			TTFTMs:       ttftMs,
+			InputTokens:  rec.Metrics.InputTokens,
+			OutputTokens: rec.Metrics.OutputTokens,
+			Status:       string(rec.Status),
+			ErrorMsg:     rec.RawError,
+		}})
+		cancel()
+		if err != nil {
+			p.logger.Warn("save trace span failed", "trace_id", rec.TraceID, "span_id", meta.spanID, "err", err)
+		}
+	}
 
 	if p.opts.Recorder == nil {
 		return

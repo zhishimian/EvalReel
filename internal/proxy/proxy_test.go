@@ -19,8 +19,10 @@ import (
 	"evalreel/internal/config"
 	"evalreel/internal/mockllm"
 	"evalreel/internal/model"
+	"evalreel/internal/observability"
 	"evalreel/internal/recorder"
 	"evalreel/internal/sse"
+	"evalreel/internal/store"
 
 	"go.uber.org/goleak"
 )
@@ -352,6 +354,102 @@ func TestProxy_CompatibleModeV1PathJoin(t *testing.T) {
 
 	if gotPath != "/compatible-mode/v1/models" {
 		t.Fatalf("expected upstream path /compatible-mode/v1/models, got %q", gotPath)
+	}
+}
+
+func TestProxy_TraceparentAndSpanStore(t *testing.T) {
+	mockCfg := mockllm.DefaultConfig()
+	mockCfg.TTFT = 5 * time.Millisecond
+	mockSrv := httptest.NewServer(mockllm.NewServer(mockCfg).Handler())
+	defer mockSrv.Close()
+
+	tracePath := filepath.Join(t.TempDir(), "multi.jsonl.gz")
+	rec, err := recorder.NewGzipJSONLRecorder(tracePath)
+	if err != nil {
+		t.Fatalf("NewGzipJSONLRecorder: %v", err)
+	}
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "spans.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer st.Close()
+
+	p, err := New(Options{
+		UpstreamURL:    mockSrv.URL,
+		SessionID:      "multi-sess",
+		Recorder:       rec,
+		SpanStore:      st,
+		EstimateTokens: sse.HeuristicEstimateTokens,
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	proxySrv := httptest.NewServer(p.Handler())
+
+	traceID := observability.NewTraceID()
+	rootSpanID := observability.NewSpanID()
+
+	// 1. planner 携带根 traceparent 请求。
+	req1, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"mock-reasoning-v1","stream":false,"messages":[{"role":"user","content":"plan"}]}`))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("traceparent", observability.FormatTraceparent(traceID, rootSpanID))
+	req1.Header.Set("X-EvalReel-Agent-Name", "planner")
+	req1.Header.Set("X-EvalReel-Run-ID", "run-multi-1")
+	req1.Header.Set("X-EvalReel-Task-ID", "tk-multi-1")
+
+	resp1, err := proxySrv.Client().Do(req1)
+	if err != nil {
+		t.Fatalf("req1 failed: %v", err)
+	}
+	plannerSpanID := resp1.Header.Get("X-EvalReel-Span-ID")
+	_, _ = io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if plannerSpanID == "" {
+		t.Fatalf("expected non-empty X-EvalReel-Span-ID header")
+	}
+
+	// 2. coder 以 planner 返回的 span_id 为父节点发起子请求。
+	req2, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"mock-reasoning-v1","stream":false,"messages":[{"role":"user","content":"code"}]}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("traceparent", observability.FormatTraceparent(traceID, plannerSpanID))
+	req2.Header.Set("X-EvalReel-Agent-Name", "coder")
+	req2.Header.Set("X-EvalReel-Run-ID", "run-multi-1")
+	req2.Header.Set("X-EvalReel-Task-ID", "tk-multi-1")
+
+	resp2, err := proxySrv.Client().Do(req2)
+	if err != nil {
+		t.Fatalf("req2 failed: %v", err)
+	}
+	coderSpanID := resp2.Header.Get("X-EvalReel-Span-ID")
+	_, _ = io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	proxySrv.Client().CloseIdleConnections()
+	proxySrv.Close()
+	p.CloseIdleConnections()
+	if err := rec.Close(); err != nil {
+		t.Fatalf("rec.Close: %v", err)
+	}
+
+	traces := readTraces(t, tracePath)
+	if len(traces) != 2 {
+		t.Fatalf("expected 2 traces, got %d", len(traces))
+	}
+	if traces[0].TraceID != traceID || traces[0].SpanID != plannerSpanID || traces[0].ParentSpanID != rootSpanID || traces[0].AgentName != "planner" {
+		t.Fatalf("unexpected planner trace fields: %+v", traces[0])
+	}
+	if traces[1].TraceID != traceID || traces[1].SpanID != coderSpanID || traces[1].ParentSpanID != plannerSpanID || traces[1].AgentName != "coder" {
+		t.Fatalf("unexpected coder trace fields: %+v", traces[1])
+	}
+
+	spans, err := st.ListSpansByTraceID(context.Background(), traceID)
+	if err != nil || len(spans) != 2 {
+		t.Fatalf("ListSpansByTraceID: len=%d err=%v", len(spans), err)
+	}
+	if spans[0].AgentName != "planner" || spans[1].AgentName != "coder" || spans[1].ParentSpanID != spans[0].SpanID {
+		t.Fatalf("unexpected persisted spans hierarchy: %+v", spans)
 	}
 }
 

@@ -407,7 +407,21 @@ func executeEvalRun(
 	if err != nil {
 		return err
 	}
-	summary := report.Aggregate(run, tasks, scores)
+	spansByTrace := make(map[string][]store.TraceSpan)
+	for _, tk := range tasks {
+		if tk.TraceID == "" {
+			continue
+		}
+		if _, seen := spansByTrace[tk.TraceID]; seen {
+			continue
+		}
+		if sp, sErr := st.ListSpansByTraceID(ctx, tk.TraceID); sErr == nil && len(sp) > 0 {
+			spansByTrace[tk.TraceID] = sp
+		} else {
+			spansByTrace[tk.TraceID] = nil
+		}
+	}
+	summary := report.AggregateWithSpans(run, tasks, scores, spansByTrace)
 	htmlStr, err := report.RenderHTML(summary)
 	if err != nil {
 		return err

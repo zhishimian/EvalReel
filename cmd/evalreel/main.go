@@ -21,6 +21,7 @@ import (
 	"evalreel/internal/proxy"
 	"evalreel/internal/recorder"
 	"evalreel/internal/sse"
+	"evalreel/internal/store"
 )
 
 func main() {
@@ -97,6 +98,8 @@ func runProxy(args []string) {
 	listenOverride := fs.String("listen", "", "覆盖代理监听地址")
 	upstreamOverride := fs.String("upstream", "", "覆盖上游大模型地址")
 	outDirOverride := fs.String("out", "", "覆盖轨迹输出目录")
+	dbPath := fs.String("db", envOrDefault("EVALREEL_DB_PATH", ""), "可选 SQLite 路径（填写后同步写入 trace_spans 表）")
+	mysqlDSN := fs.String("mysql-dsn", envOrDefault("EVALREEL_MYSQL_DSN", ""), "可选 MySQL DSN（填写后同步写入 trace_spans 表）")
 	logFormat := fs.String("log-format", envOrDefault("EVALREEL_LOG_FORMAT", "text"), "日志格式: text|json")
 	logLevel := fs.String("log-level", envOrDefault("EVALREEL_LOG_LEVEL", "info"), "日志级别: debug|info|warn|error")
 	otelExporter := fs.String("otel-exporter", envOrDefault("EVALREEL_OTEL_EXPORTER", "none"), "OpenTelemetry 导出: none|stdout|otlp")
@@ -163,6 +166,25 @@ func runProxy(args []string) {
 		os.Exit(1)
 	}
 
+	var spanStore store.Store
+	if *mysqlDSN != "" {
+		spanStore, err = store.NewMySQLStore(*mysqlDSN)
+		if err != nil {
+			logger.Error("open mysql span store failed", "err", err)
+			_ = rec.Close()
+			os.Exit(1)
+		}
+		defer spanStore.Close()
+	} else if *dbPath != "" {
+		spanStore, err = store.NewSQLiteStore(*dbPath)
+		if err != nil {
+			logger.Error("open sqlite span store failed", "err", err)
+			_ = rec.Close()
+			os.Exit(1)
+		}
+		defer spanStore.Close()
+	}
+
 	chaosEngine := chaos.NewEngine(cfg.Chaos)
 	p, err := proxy.New(proxy.Options{
 		UpstreamURL:      cfg.Upstream.BaseURL,
@@ -170,6 +192,7 @@ func runProxy(args []string) {
 		SessionID:        sessionID,
 		MaxRequestBodyMB: cfg.Recorder.MaxRequestBodyMB,
 		Recorder:         rec,
+		SpanStore:        spanStore,
 		Chaos:            chaosEngine,
 		EstimateTokens:   sse.NewTiktokenEstimator(),
 		Logger:           logger,
