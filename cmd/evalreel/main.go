@@ -33,6 +33,10 @@ func main() {
 		runMockLLM(os.Args[2:])
 	case "proxy":
 		runProxy(os.Args[2:])
+	case "eval":
+		runEval(os.Args[2:])
+	case "serve":
+		runServe(os.Args[2:])
 	default:
 		printUsage()
 		os.Exit(1)
@@ -217,4 +221,6 @@ func printUsage() {
 	fmt.Println("可用子命令:")
 	fmt.Println("  mockllm   启动本地模拟 OpenAI 流式服务")
 	fmt.Println("  proxy     启动透明流式反向代理与轨迹录制服务")
+	fmt.Println("  eval      读取 JSON 配置批量运行评测并生成 report.html")
+	fmt.Println("  serve     启动 Gin 评测控制面 API 与 SSE 实时进度服务")
 }

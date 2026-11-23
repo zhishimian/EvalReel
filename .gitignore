@@ -9,3 +9,7 @@ configs/*.local.yaml
 *.test
 __pycache__/
 *.pyc
+reports/
+*.db
+*.db-wal
+*.db-shm

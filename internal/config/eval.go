@@ -37,16 +37,17 @@ type AgentConfig struct {
 	TimeoutSec int      `json:"timeout_sec"`
 }
 
-// TargetConfig 描述一个待测大模型或接口目标的地址、限流与单价信息。
+// TargetConfig 描述一个待测大模型或接口目标的地址、限流、单价与可选独立 Agent 命令。
 type TargetConfig struct {
-	Name              string  `json:"name"`
-	BaseURL           string  `json:"base_url"`
-	APIKeyEnv         string  `json:"api_key_env"`
-	APIKey            string  `json:"api_key,omitempty"`
-	Model             string  `json:"model"`
-	RPM               int     `json:"rpm_limit"`
-	InputPricePer1M   float64 `json:"input_price_per_1m"`
-	OutputPricePer1M  float64 `json:"output_price_per_1m"`
+	Name             string       `json:"name"`
+	BaseURL          string       `json:"base_url"`
+	APIKeyEnv        string       `json:"api_key_env"`
+	APIKey           string       `json:"api_key,omitempty"`
+	Model            string       `json:"model"`
+	RPM              int          `json:"rpm_limit"`
+	InputPricePer1M  float64      `json:"input_price_per_1m"`
+	OutputPricePer1M float64      `json:"output_price_per_1m"`
+	Agent            *AgentConfig `json:"agent,omitempty"`
 }
 
 // ScorerConfig 描述单个自动批卷器的类型与评判参数。
@@ -120,7 +121,11 @@ func (c *EvalConfig) Validate() error {
 		return errors.New("fork mode requires fork_source.trace_file")
 	}
 	if c.Mode == "agent" && c.Agent.Command == "" {
-		return errors.New("agent mode requires agent.command")
+		for i, tgt := range c.Targets {
+			if tgt.Agent == nil || tgt.Agent.Command == "" {
+				return fmt.Errorf("agent mode requires top-level agent.command or target[%d].agent.command", i)
+			}
+		}
 	}
 	return nil
 }
