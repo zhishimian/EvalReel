@@ -137,6 +137,7 @@ func runServe(args []string) {
 	logLevel := fs.String("log-level", envOrDefault("EVALREEL_LOG_LEVEL", "info"), "日志级别: debug|info|warn|error")
 	otelExporter := fs.String("otel-exporter", envOrDefault("EVALREEL_OTEL_EXPORTER", "none"), "OpenTelemetry 导出: none|stdout|otlp")
 	otelEndpoint := fs.String("otel-endpoint", envOrDefault("EVALREEL_OTEL_ENDPOINT", ""), "OTLP HTTP 收集端地址")
+	pprofListen := fs.String("pprof-listen", envOrDefault("EVALREEL_PPROF_LISTEN", ""), "可选 pprof 性能剖析监听地址")
 	_ = fs.Parse(args)
 
 	logger := observability.NewLogger(observability.LogConfig{
@@ -237,6 +238,21 @@ func runServe(args []string) {
 		apiSrv.SetQueueStatsProvider(dispatcher.GetQueueStats)
 	}
 
+	var pprofSrv *http.Server
+	if *pprofListen != "" {
+		pprofSrv = &http.Server{
+			Addr:              *pprofListen,
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Info("server pprof endpoint started", "addr", *pprofListen)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("pprof server stopped", "err", err)
+			}
+		}()
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           apiSrv.Handler(),
@@ -259,6 +275,9 @@ func runServe(args []string) {
 	sdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(sdCtx)
+	if pprofSrv != nil {
+		_ = pprofSrv.Shutdown(sdCtx)
+	}
 	apiSrv.Shutdown()
 	_ = otelShutdown(sdCtx)
 }

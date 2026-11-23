@@ -308,3 +308,43 @@ func TestChatCompletionsDirtyFaults(t *testing.T) {
 		})
 	}
 }
+
+func TestMockLLM_ChunksAndRandom429(t *testing.T) {
+	// 1. 测试 Chunks > 0 按块流式输出。
+	cfgChunks := Config{
+		TTFT:          2 * time.Millisecond,
+		ChunkInterval: 2 * time.Millisecond,
+		Chunks:        12,
+		ModelName:     "mock-slow",
+	}
+	srv := httptest.NewServer(NewServer(cfgChunks).Handler())
+	defer srv.Close()
+
+	resp, err := srv.Client().Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(raw), "分片12 ") {
+		t.Fatalf("expected 12th chunk in response body, got:\n%s", string(raw))
+	}
+
+	// 2. 测试 Fault429Rate = 1.0 时稳定返回 429 与 Retry-After。
+	cfg429 := Config{
+		TTFT:         2 * time.Millisecond,
+		Fault429Rate: 1.0,
+		ModelName:    "mock-slow",
+	}
+	srv429 := httptest.NewServer(NewServer(cfg429).Handler())
+	defer srv429.Close()
+
+	r429, err := srv429.Client().Post(srv429.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("POST 429 failed: %v", err)
+	}
+	r429.Body.Close()
+	if r429.StatusCode != http.StatusTooManyRequests || r429.Header.Get("Retry-After") != "1" {
+		t.Fatalf("expected 429 with Retry-After=1, got %d (%q)", r429.StatusCode, r429.Header.Get("Retry-After"))
+	}
+}

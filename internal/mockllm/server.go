@@ -4,16 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config 定义模拟大模型服务的默认行为参数与取消回调。
+// Config 定义模拟大模型服务的默认行为参数、流式分块数、随机 429 概率与取消回调。
 type Config struct {
 	TTFT          time.Duration
 	ChunkInterval time.Duration
+	Chunks        int     // >0 时按指定块数输出正文流式分块，用于真实慢流式压测
+	Fault429Rate  float64 // 0~1 之间，未显式传 X-Mock-Fault 时随机返回 429 的概率
 	ModelName     string
 	OnCanceled    func()
 }
@@ -92,10 +95,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ttft := parseDurationHeader(r, "X-Mock-TTFT-Ms", s.cfg.TTFT)
 	interval := parseDurationHeader(r, "X-Mock-Chunk-Interval-Ms", s.cfg.ChunkInterval)
 	fault := strings.TrimSpace(r.Header.Get("X-Mock-Fault"))
+	retryAfter := "2"
+	if fault == "" && s.cfg.Fault429Rate > 0 && rand.Float64() < s.cfg.Fault429Rate {
+		fault = "429"
+		retryAfter = "1"
+	}
 
 	switch fault {
 	case "429":
-		w.Header().Set("Retry-After", "2")
+		w.Header().Set("Retry-After", retryAfter)
 		writeJSONError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "mock rate limit triggered")
 		return
 	case "500":
@@ -215,16 +223,27 @@ func (s *Server) writeStreamResponse(w http.ResponseWriter, r *http.Request, mod
 			return
 		}
 	default:
-		reasoningParts := []string{"先确认输入条件，", "再组织清晰步骤。"}
-		contentParts := []string{"你好，", "这里是模拟流式响应，", "用于测试延迟与解析。"}
-		for _, part := range reasoningParts {
-			if !sendChunk(makeDeltaChunk(modelName, map[string]any{"reasoning_content": part}, nil)) {
+		if s.cfg.Chunks > 0 {
+			if !sendChunk(makeDeltaChunk(modelName, map[string]any{"reasoning_content": "先分析条件，"}, nil)) {
 				return
 			}
-		}
-		for _, part := range contentParts {
-			if !sendChunk(makeDeltaChunk(modelName, map[string]any{"content": part}, nil)) {
-				return
+			for i := 1; i <= s.cfg.Chunks; i++ {
+				if !sendChunk(makeDeltaChunk(modelName, map[string]any{"content": fmt.Sprintf("分片%d ", i)}, nil)) {
+					return
+				}
+			}
+		} else {
+			reasoningParts := []string{"先确认输入条件，", "再组织清晰步骤。"}
+			contentParts := []string{"你好，", "这里是模拟流式响应，", "用于测试延迟与解析。"}
+			for _, part := range reasoningParts {
+				if !sendChunk(makeDeltaChunk(modelName, map[string]any{"reasoning_content": part}, nil)) {
+					return
+				}
+			}
+			for _, part := range contentParts {
+				if !sendChunk(makeDeltaChunk(modelName, map[string]any{"content": part}, nil)) {
+					return
+				}
 			}
 		}
 	}

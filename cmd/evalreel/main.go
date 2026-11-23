@@ -52,6 +52,8 @@ func runMockLLM(args []string) {
 	listen := fs.String("listen", "127.0.0.1:9090", "模拟大模型服务的监听地址")
 	ttft := fs.Duration("ttft", 300*time.Millisecond, "首字等待时间")
 	interval := fs.Duration("interval", 30*time.Millisecond, "每块流式输出的时间间隔")
+	chunks := fs.Int("chunks", 0, "正文流式输出块数（>0 时用于构造真实长流式负载）")
+	fault429Rate := fs.Float64("fault-429-rate", 0, "随机注入 HTTP 429 的概率（0.0~1.0）")
 	modelName := fs.String("model", "mock-reasoning-v1", "默认返回的模型名")
 	_ = fs.Parse(args)
 
@@ -59,6 +61,8 @@ func runMockLLM(args []string) {
 	cfg := mockllm.Config{
 		TTFT:          *ttft,
 		ChunkInterval: *interval,
+		Chunks:        *chunks,
+		Fault429Rate:  *fault429Rate,
 		ModelName:     *modelName,
 		OnCanceled: func() {
 			logger.Info("upstream generation canceled by client")

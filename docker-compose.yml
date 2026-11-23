@@ -44,7 +44,7 @@ services:
     image: evalreel:dev
     container_name: evalreel-mockllm
     restart: unless-stopped
-    command: ["mockllm", "--listen", ":9090", "--ttft", "300ms", "--interval", "30ms"]
+    command: ["mockllm", "-listen=:9090", "-ttft=500ms", "-interval=100ms", "-chunks=20", "-fault-429-rate=0.05"]
     ports:
       - "9090:9090"
 
@@ -55,13 +55,14 @@ services:
     image: evalreel:dev
     container_name: evalreel-server
     restart: unless-stopped
-    command: ["serve", "-mode=server", "-listen=:8081"]
+    command: ["serve", "-mode=server", "-listen=:8081", "-pprof-listen=:6061"]
     environment:
       EVALREEL_MYSQL_DSN: ${EVALREEL_MYSQL_DSN:-evalreel:evalreel_dev@tcp(mysql:3306)/evalreel?charset=utf8mb4&parseTime=True&loc=UTC}
       EVALREEL_REDIS_ADDR: redis:6379
       EVALREEL_LOG_FORMAT: json
     ports:
       - "8081:8081"
+      - "6061:6061"
     volumes:
       - ./testdata:/app/testdata:ro
       - ./reports:/app/reports
@@ -77,7 +78,7 @@ services:
       dockerfile: Dockerfile
     image: evalreel:dev
     restart: unless-stopped
-    command: ["worker", "-concurrency=10", "-output-dir=/app/reports", "-metrics-listen=:8082"]
+    command: ["worker", "-concurrency=25", "-output-dir=/app/reports", "-metrics-listen=:8082"]
     environment:
       EVALREEL_MYSQL_DSN: ${EVALREEL_MYSQL_DSN:-evalreel:evalreel_dev@tcp(mysql:3306)/evalreel?charset=utf8mb4&parseTime=True&loc=UTC}
       EVALREEL_REDIS_ADDR: redis:6379
