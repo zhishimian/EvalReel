@@ -240,3 +240,35 @@ func TestMySQLStore_Spans(t *testing.T) {
 		t.Fatalf("ListSpansByTraceID: got=%+v err=%v", got, err)
 	}
 }
+
+func TestMySQLStore_ResetFailedTasks(t *testing.T) {
+	st, prefix := openTestMySQLStore(t)
+	ctx := context.Background()
+
+	runID := prefix + "rf"
+	tasks := []EvalTask{
+		{ID: prefix + "rf0", RunID: runID, ItemID: "i0", TargetName: "m1", Status: TaskPending},
+		{ID: prefix + "rf1", RunID: runID, ItemID: "i1", TargetName: "m1", Status: TaskPending},
+	}
+	if err := st.CreateRun(ctx, &EvalRun{
+		ID:         runID,
+		Mode:       "benchmark",
+		Status:     RunRunning,
+		ConfigJSON: `{}`,
+		TotalTasks: 2,
+	}, tasks); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	_ = st.UpdateTaskResult(ctx, tasks[0].ID, TaskResultUpdate{Status: TaskSuccess})
+	_ = st.UpdateTaskResult(ctx, tasks[1].ID, TaskResultUpdate{Status: TaskFailed, ErrorMsg: "timeout"})
+	_, _ = st.TryFinalizeRun(ctx, runID, time.Now())
+
+	retried, err := st.ResetFailedTasks(ctx, runID)
+	if err != nil || retried != 1 {
+		t.Fatalf("ResetFailedTasks: retried=%d err=%v", retried, err)
+	}
+	meta, err := st.GetRunMeta(ctx, runID)
+	if err != nil || meta.Status != RunRunning || meta.DoneTasks != 1 || meta.FailedTasks != 0 {
+		t.Fatalf("unexpected mysql run state after reset: %+v err=%v", meta, err)
+	}
+}

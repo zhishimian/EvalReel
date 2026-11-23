@@ -265,6 +265,94 @@ func TestAPI_ReportDownload(t *testing.T) {
 	}
 }
 
+func TestAPI_RetryFailedAndArchivedQueues(t *testing.T) {
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "retry_api.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	var launched atomic.Int32
+	srv := NewServer(
+		st,
+		scheduler.NewProgressBroker(),
+		nil,
+		func(_ context.Context, _ string, _ *config.EvalConfig) {
+			launched.Add(1)
+		},
+	)
+	srv.SetArchivedQueueProviders(
+		func(_ context.Context, _ int) ([]scheduler.ArchivedTaskInfo, error) {
+			return []scheduler.ArchivedTaskInfo{{ID: "arch-1", LastErr: "429"}}, nil
+		},
+		func(_ context.Context, ids []string, all bool) (int, error) {
+			if all {
+				return 3, nil
+			}
+			return len(ids), nil
+		},
+	)
+	t.Cleanup(func() {
+		srv.Shutdown()
+		_ = st.Close()
+	})
+
+	ctx := context.Background()
+	_ = st.CreateRun(ctx, &store.EvalRun{
+		ID:         "run-retry-api",
+		Name:       "retry api",
+		Mode:       "benchmark",
+		Status:     store.RunRunning,
+		ConfigJSON: `{"name":"retry api","mode":"benchmark","targets":[{"name":"m1","base_url":"http://127.0.0.1:9090/v1","model":"m1"}]}`,
+		TotalTasks: 2,
+	}, []store.EvalTask{
+		{ID: "rt-1", RunID: "run-retry-api", ItemID: "i1", TargetName: "m1", Status: store.TaskPending},
+		{ID: "rt-2", RunID: "run-retry-api", ItemID: "i2", TargetName: "m1", Status: store.TaskPending},
+	})
+	_ = st.UpdateTaskResult(ctx, "rt-1", store.TaskResultUpdate{Status: store.TaskSuccess})
+	_ = st.UpdateTaskResult(ctx, "rt-2", store.TaskResultUpdate{Status: store.TaskFailed, ErrorMsg: "err"})
+
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		httpSrv.Client().CloseIdleConnections()
+		httpSrv.Close()
+	}()
+
+	rRetry, err := httpSrv.Client().Post(httpSrv.URL+"/api/runs/run-retry-api/retry-failed", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST retry-failed: %v", err)
+	}
+	var retryOut struct {
+		RetriedTasks int `json:"retried_tasks"`
+	}
+	_ = json.NewDecoder(rRetry.Body).Decode(&retryOut)
+	rRetry.Body.Close()
+	if rRetry.StatusCode != http.StatusAccepted || retryOut.RetriedTasks != 1 {
+		t.Fatalf("unexpected retry-failed response: code=%d out=%+v", rRetry.StatusCode, retryOut)
+	}
+
+	rArch, err := httpSrv.Client().Get(httpSrv.URL + "/api/queues/archived")
+	if err != nil {
+		t.Fatalf("GET archived: %v", err)
+	}
+	archRaw, _ := io.ReadAll(rArch.Body)
+	rArch.Body.Close()
+	if rArch.StatusCode != http.StatusOK || !strings.Contains(string(archRaw), "arch-1") {
+		t.Fatalf("unexpected archived response: code=%d body=%s", rArch.StatusCode, string(archRaw))
+	}
+
+	rArchRetry, err := httpSrv.Client().Post(httpSrv.URL+"/api/queues/archived/retry", "application/json", strings.NewReader(`{"all":true}`))
+	if err != nil {
+		t.Fatalf("POST archived/retry: %v", err)
+	}
+	var archRetryOut struct {
+		RetriedCount int `json:"retried_count"`
+	}
+	_ = json.NewDecoder(rArchRetry.Body).Decode(&archRetryOut)
+	rArchRetry.Body.Close()
+	if rArchRetry.StatusCode != http.StatusOK || archRetryOut.RetriedCount != 3 {
+		t.Fatalf("unexpected archived/retry response: code=%d out=%+v", rArchRetry.StatusCode, archRetryOut)
+	}
+}
+
 func TestAPI_IdempotencyKey(t *testing.T) {
 	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "idem_test.db"))
 	if err != nil {

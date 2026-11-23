@@ -121,4 +121,17 @@ func TestAsynqDispatcher_EnqueueAndStats(t *testing.T) {
 	if stats.Pending != 5 {
 		t.Fatalf("expected Pending=5, got %+v", stats)
 	}
+
+	// 验证 RedispatchTasks 可以覆盖去重并安全调用 ListArchivedTasks / RetryArchivedTasks。
+	if err := disp.RedispatchTasks(ctx, "run-asynq", tasks[:2], cfg); err != nil {
+		t.Fatalf("RedispatchTasks: %v", err)
+	}
+	archived, err := disp.ListArchivedTasks(ctx, 10)
+	if err != nil || len(archived) != 0 {
+		t.Fatalf("expected 0 archived tasks, got %+v err=%v", archived, err)
+	}
+	retried, err := disp.RetryArchivedTasks(ctx, nil, true)
+	if err != nil || retried != 0 {
+		t.Fatalf("expected 0 retried archived tasks, got %d err=%v", retried, err)
+	}
 }

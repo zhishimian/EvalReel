@@ -207,7 +207,7 @@ func runServe(args []string) {
 				_ = st.UpdateRunStatus(context.Background(), runID, store.RunFailed)
 				return
 			}
-			if dErr := dispatcher.DispatchRun(ctx, runID, tasks, *cfg); dErr != nil {
+			if dErr := dispatcher.RedispatchTasks(ctx, runID, tasks, *cfg); dErr != nil {
 				logger.Error("dispatch tasks to asynq failed", "run_id", runID, "err", dErr)
 				_ = st.UpdateRunStatus(context.Background(), runID, store.RunFailed)
 			}
@@ -236,6 +236,7 @@ func runServe(args []string) {
 	)
 	if dispatcher != nil {
 		apiSrv.SetQueueStatsProvider(dispatcher.GetQueueStats)
+		apiSrv.SetArchivedQueueProviders(dispatcher.ListArchivedTasks, dispatcher.RetryArchivedTasks)
 	}
 
 	var pprofSrv *http.Server

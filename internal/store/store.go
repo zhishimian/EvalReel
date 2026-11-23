@@ -22,6 +22,7 @@ type Store interface {
 	MarkTaskRunning(ctx context.Context, taskID string, retryCount int) error
 	UpdateTaskResult(ctx context.Context, taskID string, update TaskResultUpdate) error
 	UpdateRunStatus(ctx context.Context, runID string, status RunStatus) error
+	ResetFailedTasks(ctx context.Context, runID string) (int64, error)
 	TryFinalizeRun(ctx context.Context, runID string, finishedAt time.Time) (bool, error)
 	SaveScores(ctx context.Context, scores []EvalScore) error
 	GetRun(ctx context.Context, runID string) (*EvalRun, []EvalTask, []EvalScore, error)

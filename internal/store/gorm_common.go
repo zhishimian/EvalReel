@@ -199,7 +199,52 @@ func (s *gormStore) UpdateRunStatus(ctx context.Context, runID string, status Ru
 	return nil
 }
 
-// TryFinalizeRun 在多 Worker 场景下以条件更新竞争整场评测的唯一收口权，仅一个调用者会返回 true。
+// ResetFailedTasks 将指定总任务下所有 failed 子任务重置为 pending 并回退计数，供单机与集群重跑失败项。
+func (s *gormStore) ResetFailedTasks(ctx context.Context, runID string) (int64, error) {
+	var retried int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run EvalRun
+		if err := tx.Where("id = ?", runID).First(&run).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("query run %s: %w", runID, err)
+		}
+
+		res := tx.Model(&EvalTask{}).
+			Where("run_id = ? AND status = ?", runID, TaskFailed).
+			Updates(map[string]any{
+				"status":    TaskPending,
+				"error_msg": "",
+			})
+		if res.Error != nil {
+			return fmt.Errorf("reset failed tasks: %w", res.Error)
+		}
+		retried = res.RowsAffected
+		if retried == 0 {
+			return nil
+		}
+
+		newDone := run.DoneTasks - int(retried)
+		if newDone < 0 {
+			newDone = 0
+		}
+		newFailed := run.FailedTasks - int(retried)
+		if newFailed < 0 {
+			newFailed = 0
+		}
+		if err := tx.Model(&EvalRun{}).Where("id = ?", runID).Updates(map[string]any{
+			"status":       RunRunning,
+			"done_tasks":   newDone,
+			"failed_tasks": newFailed,
+			"finished_at":  nil,
+		}).Error; err != nil {
+			return fmt.Errorf("reset run counters: %w", err)
+		}
+		return nil
+	})
+	return retried, err
+}
 func (s *gormStore) TryFinalizeRun(ctx context.Context, runID string, finishedAt time.Time) (bool, error) {
 	if finishedAt.IsZero() {
 		finishedAt = time.Now().UTC()

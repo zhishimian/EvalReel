@@ -29,16 +29,18 @@ type RunLauncher func(ctx context.Context, runID string, cfg *config.EvalConfig)
 
 // Server 提供基于 Gin 的评测控制接口与 SSE 实时进度推送服务。
 type Server struct {
-	engine     *gin.Engine
-	store      store.Store
-	broker     scheduler.ProgressBus
-	builder    TaskBuilder
-	launcher   RunLauncher
-	queueStats func(context.Context) (*scheduler.QueueStats, error)
-	baseCtx    context.Context
-	cancel     context.CancelFunc
-	bgWG       sync.WaitGroup
-	runSeq     atomic.Uint64
+	engine       *gin.Engine
+	store        store.Store
+	broker       scheduler.ProgressBus
+	builder      TaskBuilder
+	launcher     RunLauncher
+	queueStats   func(context.Context) (*scheduler.QueueStats, error)
+	listArchived func(context.Context, int) ([]scheduler.ArchivedTaskInfo, error)
+	retryArchive func(context.Context, []string, bool) (int, error)
+	baseCtx      context.Context
+	cancel       context.CancelFunc
+	bgWG         sync.WaitGroup
+	runSeq       atomic.Uint64
 }
 
 // NewServer 创建并挂载全部路由的 Gin API 服务实例。
@@ -62,7 +64,10 @@ func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder
 	apiGroup := r.Group("/api")
 	apiGroup.GET("/health", s.handleHealth)
 	apiGroup.GET("/queues/stats", s.handleQueueStats)
+	apiGroup.GET("/queues/archived", s.handleListArchived)
+	apiGroup.POST("/queues/archived/retry", s.handleRetryArchived)
 	apiGroup.POST("/runs", s.handleCreateRun)
+	apiGroup.POST("/runs/:id/retry-failed", s.handleRetryFailed)
 	apiGroup.GET("/runs", s.handleListRuns)
 	apiGroup.GET("/runs/:id", s.handleGetRun)
 	apiGroup.GET("/runs/:id/events", s.handleRunEvents)
@@ -74,6 +79,15 @@ func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder
 // SetQueueStatsProvider 注入分布式任务队列状态查询回调（服务端模式下由 AsynqDispatcher 提供）。
 func (s *Server) SetQueueStatsProvider(fn func(context.Context) (*scheduler.QueueStats, error)) {
 	s.queueStats = fn
+}
+
+// SetArchivedQueueProviders 注入死信队列查看与重放回调（服务端模式下使用）。
+func (s *Server) SetArchivedQueueProviders(
+	listFn func(context.Context, int) ([]scheduler.ArchivedTaskInfo, error),
+	retryFn func(context.Context, []string, bool) (int, error),
+) {
+	s.listArchived = listFn
+	s.retryArchive = retryFn
 }
 
 // Handler 返回标准 http.Handler 供 http.Server 或 httptest 挂载。
@@ -307,4 +321,79 @@ func (s *Server) handleGetReport(c *gin.Context) {
 
 func isTerminalStatus(st store.RunStatus) bool {
 	return st == store.RunCompleted || st == store.RunFailed || st == store.RunCanceled
+}
+
+func (s *Server) handleRetryFailed(c *gin.Context) {
+	runID := c.Param("id")
+	run, err := s.store.GetRunMeta(c.Request.Context(), runID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	retried, err := s.store.ResetFailedTasks(c.Request.Context(), runID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reset failed tasks: " + err.Error()})
+		return
+	}
+	if retried > 0 && s.launcher != nil {
+		var cfg config.EvalConfig
+		if uErr := json.Unmarshal([]byte(run.ConfigJSON), &cfg); uErr == nil {
+			cfg.ApplyDefaults()
+			s.bgWG.Add(1)
+			go func() {
+				defer s.bgWG.Done()
+				s.launcher(s.baseCtx, runID, &cfg)
+			}()
+		}
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"run_id":        runID,
+		"retried_tasks": retried,
+	})
+}
+
+func (s *Server) handleListArchived(c *gin.Context) {
+	if s.listArchived == nil {
+		c.JSON(http.StatusOK, gin.H{"tasks": []any{}})
+		return
+	}
+	limit := 50
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	tasks, err := s.listArchived(c.Request.Context(), limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"tasks": tasks})
+}
+
+func (s *Server) handleRetryArchived(c *gin.Context) {
+	if s.retryArchive == nil {
+		c.JSON(http.StatusOK, gin.H{"retried_count": 0})
+		return
+	}
+	var req struct {
+		TaskIDs []string `json:"task_ids"`
+		All     bool     `json:"all"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json: " + err.Error()})
+		return
+	}
+	n, err := s.retryArchive(c.Request.Context(), req.TaskIDs, req.All)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"retried_count": n})
 }

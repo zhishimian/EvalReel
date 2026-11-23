@@ -339,3 +339,53 @@ func TestSQLiteStore_IdempotencyFinalizeGetTaskAndSpans(t *testing.T) {
 		t.Fatalf("ListSpansByTraceID: spans=%+v err=%v", gotSpans, err)
 	}
 }
+
+func TestSQLiteStore_ResetFailedTasks(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+
+	tasks := make([]EvalTask, 5)
+	for i := 0; i < 5; i++ {
+		tasks[i] = EvalTask{
+			ID:         fmt.Sprintf("rf-tk-%d", i),
+			RunID:      "run-rf-1",
+			ItemID:     fmt.Sprintf("q-%d", i),
+			TargetName: "m1",
+			TrialIndex: 0,
+			Status:     TaskPending,
+		}
+	}
+	if err := st.CreateRun(ctx, &EvalRun{
+		ID:         "run-rf-1",
+		Name:       "retry failed",
+		Mode:       "benchmark",
+		Status:     RunRunning,
+		ConfigJSON: `{}`,
+		TotalTasks: 5,
+	}, tasks); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		_ = st.UpdateTaskResult(ctx, tasks[i].ID, TaskResultUpdate{Status: TaskSuccess, ResponseText: "ok"})
+	}
+	for i := 3; i < 5; i++ {
+		_ = st.UpdateTaskResult(ctx, tasks[i].ID, TaskResultUpdate{Status: TaskFailed, ErrorMsg: "429 limit"})
+	}
+	_, _ = st.TryFinalizeRun(ctx, "run-rf-1", time.Now())
+
+	retried, err := st.ResetFailedTasks(ctx, "run-rf-1")
+	if err != nil || retried != 2 {
+		t.Fatalf("expected 2 reset tasks, got retried=%d err=%v", retried, err)
+	}
+
+	meta, err := st.GetRunMeta(ctx, "run-rf-1")
+	if err != nil || meta.Status != RunRunning || meta.DoneTasks != 3 || meta.FailedTasks != 0 || meta.FinishedAt != nil {
+		t.Fatalf("unexpected run state after reset: %+v err=%v", meta, err)
+	}
+
+	pending, err := st.ClaimPendingTasks(ctx, "run-rf-1")
+	if err != nil || len(pending) != 2 || pending[0].ID != "rf-tk-3" || pending[1].ID != "rf-tk-4" {
+		t.Fatalf("unexpected pending tasks after reset: %+v err=%v", pending, err)
+	}
+}
