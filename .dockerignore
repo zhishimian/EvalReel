@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+*.db
+*.db-wal
+*.db-shm
+*.exe
+/evalreel
+traces/
+reports/
+*.jsonl.gz
+*.out
+*.test
+__pycache__/
+*.pyc
+.idea/
+docs/

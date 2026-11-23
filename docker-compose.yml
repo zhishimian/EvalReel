@@ -1,0 +1,74 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: evalreel-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-evalreel_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-evalreel}
+      MYSQL_USER: ${MYSQL_USER:-evalreel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-evalreel_dev}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    container_name: evalreel-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mockllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: evalreel:dev
+    container_name: evalreel-mockllm
+    restart: unless-stopped
+    command: ["mockllm", "--listen", ":9090", "--ttft", "300ms", "--interval", "30ms"]
+    ports:
+      - "9090:9090"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: evalreel-prometheus
+    profiles: ["observability"]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: evalreel-jaeger
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+volumes:
+  mysql_data:
+  redis_data:
