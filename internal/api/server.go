@@ -15,6 +15,7 @@ import (
 
 	"evalreel/internal/config"
 	"evalreel/internal/observability"
+	"evalreel/internal/report"
 	"evalreel/internal/scheduler"
 	"evalreel/internal/store"
 
@@ -72,6 +73,7 @@ func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder
 	apiGroup.GET("/runs/:id", s.handleGetRun)
 	apiGroup.GET("/runs/:id/events", s.handleRunEvents)
 	apiGroup.GET("/runs/:id/report", s.handleGetReport)
+	apiGroup.GET("/compare", s.handleCompareRuns)
 
 	return s
 }
@@ -396,4 +398,49 @@ func (s *Server) handleRetryArchived(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"retried_count": n})
+}
+
+func (s *Server) handleCompareRuns(c *gin.Context) {
+	rawRuns := strings.TrimSpace(c.Query("runs"))
+	if rawRuns == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter runs=id1,id2 is required"})
+		return
+	}
+	var runIDs []string
+	for _, part := range strings.Split(rawRuns, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			runIDs = append(runIDs, trimmed)
+		}
+	}
+	if len(runIDs) < 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least 2 run_ids are required for comparison"})
+		return
+	}
+
+	bundles := make([]report.RunBundle, 0, len(runIDs))
+	for _, id := range runIDs {
+		run, tasks, scores, err := s.store.GetRun(c.Request.Context(), id)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "run not found: " + id})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		bundles = append(bundles, report.RunBundle{Run: run, Tasks: tasks, Scores: scores})
+	}
+
+	targetFilter := strings.TrimSpace(c.Query("target"))
+	comp := report.CompareRuns(bundles, targetFilter)
+	if strings.EqualFold(strings.TrimSpace(c.Query("format")), "json") {
+		c.JSON(http.StatusOK, comp)
+		return
+	}
+	htmlStr, err := report.RenderCompareHTML(comp)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(htmlStr))
 }

@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"evalreel/internal/config"
 	"evalreel/internal/observability"
+	"evalreel/internal/report"
 	"evalreel/internal/scheduler"
 	"evalreel/internal/store"
 )
@@ -103,4 +106,80 @@ func runRetry(args []string) {
 		logger.Error("retry eval run failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+func runCompare(args []string) {
+	loadDotEnv(".env")
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	rawRuns := fs.String("runs", "", "按版本先后逗号分隔的 run_id 列表，例如 r1,r2,r3")
+	target := fs.String("target", "", "可选：只对比指定 target_name")
+	dbPath := fs.String("db", envOrDefault("EVALREEL_DB_PATH", "./evalreel.db"), "本地模式 SQLite 数据库文件路径")
+	mysqlDSN := fs.String("mysql-dsn", envOrDefault("EVALREEL_MYSQL_DSN", ""), "服务端模式 MySQL DSN（填写后读取 MySQL）")
+	outPath := fs.String("out", "./reports/compare.html", "输出离线回归对比 HTML 路径")
+	_ = fs.Parse(args)
+
+	logger := observability.NewLogger(observability.LogConfig{
+		Service: "evalreel-compare",
+		Format:  "text",
+		Level:   "info",
+	}, os.Stdout)
+
+	var runIDs []string
+	for _, p := range strings.Split(*rawRuns, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			runIDs = append(runIDs, t)
+		}
+	}
+	if len(runIDs) < 2 {
+		logger.Error("compare requires at least 2 run_ids via -runs r1,r2")
+		os.Exit(1)
+	}
+
+	var (
+		st  store.Store
+		err error
+	)
+	if *mysqlDSN != "" {
+		st, err = store.NewMySQLStore(*mysqlDSN)
+	} else {
+		st, err = store.NewSQLiteStore(*dbPath)
+	}
+	if err != nil {
+		logger.Error("open store failed", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	bundles := make([]report.RunBundle, 0, len(runIDs))
+	for _, id := range runIDs {
+		run, tasks, scores, gErr := st.GetRun(ctx, id)
+		if gErr != nil {
+			logger.Error("load run failed", "run_id", id, "err", gErr)
+			os.Exit(1)
+		}
+		bundles = append(bundles, report.RunBundle{Run: run, Tasks: tasks, Scores: scores})
+	}
+
+	comp := report.CompareRuns(bundles, strings.TrimSpace(*target))
+	htmlStr, err := report.RenderCompareHTML(comp)
+	if err != nil {
+		logger.Error("render compare html failed", "err", err)
+		os.Exit(1)
+	}
+	written, err := report.WriteCompareHTMLFile(*outPath, htmlStr)
+	if err != nil {
+		logger.Error("write compare html failed", "err", err)
+		os.Exit(1)
+	}
+	absPath, _ := filepath.Abs(written)
+
+	fmt.Printf("=== EvalReel 多版本回归对比完成 ===\n")
+	fmt.Printf("版本数: %d | 回归退化: %d | 修复提升: %d | 持续失败: %d | 持续稳定: %d\n",
+		len(comp.Versions), comp.Regressions, comp.Improved, comp.StableFail, comp.StablePass)
+	for _, v := range comp.Versions {
+		fmt.Printf("- v%d %-24s | 准确率: %5.1f%% | 稳定性: %5.1f%% | P95: %dms | 花费: %.4f\n",
+			v.Index, v.RunID, v.Accuracy, v.PassPowerK, v.P95Ms, v.TotalCostUSD)
+	}
+	logger.Info("compare report generated", "path", absPath)
 }

@@ -353,6 +353,44 @@ func TestAPI_RetryFailedAndArchivedQueues(t *testing.T) {
 	}
 }
 
+func TestAPI_CompareEndpoint(t *testing.T) {
+	srv, st := newTestServer(t, 0)
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		httpSrv.Client().CloseIdleConnections()
+		httpSrv.Close()
+	}()
+
+	ctx := context.Background()
+	_ = st.CreateRun(ctx, &store.EvalRun{ID: "cmp-1", Name: "v1", Mode: "benchmark", Status: store.RunCompleted, ConfigJSON: `{}`, TotalTasks: 1},
+		[]store.EvalTask{{ID: "c1-t1", RunID: "cmp-1", ItemID: "q1", TargetName: "m1", Status: store.TaskSuccess, RequestSnapshot: `{"prompt":"Q1"}`}})
+	_ = st.SaveScores(ctx, []store.EvalScore{{TaskID: "c1-t1", RunID: "cmp-1", ScorerName: "rule", Passed: true}})
+
+	_ = st.CreateRun(ctx, &store.EvalRun{ID: "cmp-2", Name: "v2", Mode: "benchmark", Status: store.RunCompleted, ConfigJSON: `{}`, TotalTasks: 1},
+		[]store.EvalTask{{ID: "c2-t1", RunID: "cmp-2", ItemID: "q1", TargetName: "m1", Status: store.TaskSuccess, RequestSnapshot: `{"prompt":"Q1"}`}})
+	_ = st.SaveScores(ctx, []store.EvalScore{{TaskID: "c2-t1", RunID: "cmp-2", ScorerName: "rule", Passed: false, Reason: "regressed"}})
+
+	rJSON, err := httpSrv.Client().Get(httpSrv.URL + "/api/compare?runs=cmp-1,cmp-2&format=json")
+	if err != nil {
+		t.Fatalf("GET compare json: %v", err)
+	}
+	rawJSON, _ := io.ReadAll(rJSON.Body)
+	rJSON.Body.Close()
+	if rJSON.StatusCode != http.StatusOK || !strings.Contains(string(rawJSON), `"regressions":1`) {
+		t.Fatalf("unexpected compare json: code=%d body=%s", rJSON.StatusCode, string(rawJSON))
+	}
+
+	rHTML, err := httpSrv.Client().Get(httpSrv.URL + "/api/compare?runs=cmp-1,cmp-2")
+	if err != nil {
+		t.Fatalf("GET compare html: %v", err)
+	}
+	rawHTML, _ := io.ReadAll(rHTML.Body)
+	rHTML.Body.Close()
+	if rHTML.StatusCode != http.StatusOK || !strings.Contains(string(rawHTML), "EvalReel 多版本回归对比报告") {
+		t.Fatalf("unexpected compare html: code=%d", rHTML.StatusCode)
+	}
+}
+
 func TestAPI_IdempotencyKey(t *testing.T) {
 	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "idem_test.db"))
 	if err != nil {

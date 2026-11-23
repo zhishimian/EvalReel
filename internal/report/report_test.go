@@ -135,3 +135,52 @@ func TestBuildCallTreeAndHTMLWaterfall(t *testing.T) {
 		t.Fatalf("html/template produced unsafe ZgotmplZ escaping marker")
 	}
 }
+
+func TestCompareRunsAndHTML(t *testing.T) {
+	// v1: q1 通过，q2 失败 -> Accuracy 50%
+	r1 := &store.EvalRun{ID: "run-v1", Name: "prompt-v1"}
+	t1 := []store.EvalTask{
+		{ID: "v1-1", RunID: r1.ID, ItemID: "q1", TargetName: "qwen", TrialIndex: 0, Status: store.TaskSuccess, TotalMs: 400, CostUSD: 0.01, RequestSnapshot: `{"prompt":"Q1"}`},
+		{ID: "v1-2", RunID: r1.ID, ItemID: "q2", TargetName: "qwen", TrialIndex: 0, Status: store.TaskSuccess, TotalMs: 500, CostUSD: 0.01, RequestSnapshot: `{"prompt":"Q2"}`},
+	}
+	s1 := []store.EvalScore{
+		{TaskID: "v1-1", RunID: r1.ID, ScorerName: "rule", Passed: true},
+		{TaskID: "v1-2", RunID: r1.ID, ScorerName: "rule", Passed: false, Reason: "missed arg"},
+	}
+
+	// v2: q1 退化失败（regression），q2 修复通过（improved）-> Accuracy 50%, Regressions=1, Improved=1
+	r2 := &store.EvalRun{ID: "run-v2", Name: "prompt-v2"}
+	t2 := []store.EvalTask{
+		{ID: "v2-1", RunID: r2.ID, ItemID: "q1", TargetName: "qwen", TrialIndex: 0, Status: store.TaskSuccess, TotalMs: 300, CostUSD: 0.02, RequestSnapshot: `{"prompt":"Q1"}`},
+		{ID: "v2-2", RunID: r2.ID, ItemID: "q2", TargetName: "qwen", TrialIndex: 0, Status: store.TaskSuccess, TotalMs: 350, CostUSD: 0.02, RequestSnapshot: `{"prompt":"Q2"}`},
+	}
+	s2 := []store.EvalScore{
+		{TaskID: "v2-1", RunID: r2.ID, ScorerName: "rule", Passed: false, Reason: "wrong tool"},
+		{TaskID: "v2-2", RunID: r2.ID, ScorerName: "rule", Passed: true},
+	}
+
+	comp := CompareRuns([]RunBundle{
+		{Run: r1, Tasks: t1, Scores: s1},
+		{Run: r2, Tasks: t2, Scores: s2},
+	}, "qwen")
+
+	if len(comp.Versions) != 2 || comp.Regressions != 1 || comp.Improved != 1 {
+		t.Fatalf("unexpected comparison summary: %+v", comp)
+	}
+	if comp.Items[0].ItemID != "q1" || comp.Items[0].ChangeType != "regression" {
+		t.Fatalf("expected regression item q1 sorted first, got %+v", comp.Items[0])
+	}
+
+	htmlStr, err := RenderCompareHTML(comp)
+	if err != nil {
+		t.Fatalf("RenderCompareHTML: %v", err)
+	}
+	for _, want := range []string{"<svg", "prompt-v1", "prompt-v2", "regression", "improved", "filterComp"} {
+		if !strings.Contains(htmlStr, want) {
+			t.Fatalf("compare html missing %q", want)
+		}
+	}
+	if strings.Contains(htmlStr, "<script src=") || strings.Contains(htmlStr, "cdn.") || strings.Contains(htmlStr, "ZgotmplZ") {
+		t.Fatalf("compare html must be offline and valid")
+	}
+}

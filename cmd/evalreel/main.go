@@ -45,6 +45,8 @@ func main() {
 		runMCPProxy(os.Args[2:])
 	case "retry":
 		runRetry(os.Args[2:])
+	case "compare":
+		runCompare(os.Args[2:])
 	default:
 		printUsage()
 		os.Exit(1)
@@ -279,4 +281,5 @@ func printUsage() {
 	fmt.Println("  worker     启动分布式评测 Worker 节点消费 Redis/Asynq 任务")
 	fmt.Println("  mcp-proxy  启动 MCP 工具透明代理、只读 Mock 与混沌故障注入服务")
 	fmt.Println("  retry      一键重跑指定评测场次中失败的子任务")
+	fmt.Println("  compare    对比多个历史评测版本的准确率趋势与回归退化题目")
 }
