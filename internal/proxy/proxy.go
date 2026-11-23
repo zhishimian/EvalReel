@@ -19,6 +19,7 @@ import (
 	"evalreel/internal/chaos"
 	"evalreel/internal/config"
 	"evalreel/internal/model"
+	"evalreel/internal/observability"
 	"evalreel/internal/recorder"
 	"evalreel/internal/sse"
 )
@@ -248,7 +249,9 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 			EstimateTokens: p.estimateTokens,
 		}
 
+		observability.DefaultMetrics().IncActiveStreams()
 		resp.Body = sse.NewTapReadCloser(resp.Request.Context(), body, opts, func(res sse.Result) {
+			observability.DefaultMetrics().DecActiveStreams()
 			if !meta.recorded.CompareAndSwap(false, true) {
 				return
 			}
@@ -420,6 +423,15 @@ func (p *Proxy) buildNonStreamRecord(meta *requestMeta, statusCode int, respByte
 }
 
 func (p *Proxy) writeRecord(rec model.TraceRecord) {
+	m := observability.DefaultMetrics()
+	chaosRule := ""
+	if rec.Chaos != nil {
+		chaosRule = rec.Chaos.RuleName
+	}
+	m.RecordProxyRequest(rec.RequestModel, string(rec.Status), chaosRule)
+	m.ObserveTTFT("proxy", rec.RequestModel, "reasoning", rec.Metrics.TTFTReasoningMs)
+	m.ObserveTTFT("proxy", rec.RequestModel, "answer", rec.Metrics.TTFTAnswerMs)
+
 	if p.opts.Recorder == nil {
 		return
 	}

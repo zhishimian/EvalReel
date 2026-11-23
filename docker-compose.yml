@@ -59,6 +59,7 @@ services:
     environment:
       EVALREEL_MYSQL_DSN: ${EVALREEL_MYSQL_DSN:-evalreel:evalreel_dev@tcp(mysql:3306)/evalreel?charset=utf8mb4&parseTime=True&loc=UTC}
       EVALREEL_REDIS_ADDR: redis:6379
+      EVALREEL_LOG_FORMAT: json
     ports:
       - "8081:8081"
     volumes:
@@ -76,10 +77,11 @@ services:
       dockerfile: Dockerfile
     image: evalreel:dev
     restart: unless-stopped
-    command: ["worker", "-concurrency=10", "-output-dir=/app/reports"]
+    command: ["worker", "-concurrency=10", "-output-dir=/app/reports", "-metrics-listen=:8082"]
     environment:
       EVALREEL_MYSQL_DSN: ${EVALREEL_MYSQL_DSN:-evalreel:evalreel_dev@tcp(mysql:3306)/evalreel?charset=utf8mb4&parseTime=True&loc=UTC}
       EVALREEL_REDIS_ADDR: redis:6379
+      EVALREEL_LOG_FORMAT: json
     volumes:
       - ./testdata:/app/testdata:ro
       - ./reports:/app/reports

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"evalreel/internal/config"
+	"evalreel/internal/observability"
 	"evalreel/internal/scheduler"
 	"evalreel/internal/store"
 
@@ -45,6 +46,7 @@ func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.GET("/metrics", gin.WrapH(observability.DefaultMetrics().Handler()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{

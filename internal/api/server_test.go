@@ -350,3 +350,22 @@ func TestAPI_IdempotencyKey(t *testing.T) {
 		t.Fatalf("expected exactly 4 launched runs (2 keyed + 2 unkeyed), got %d", launchCount.Load())
 	}
 }
+
+func TestAPI_MetricsEndpoint(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		httpSrv.Client().CloseIdleConnections()
+		httpSrv.Close()
+	}()
+
+	resp, err := httpSrv.Client().Get(httpSrv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "evalreel_") {
+		t.Fatalf("unexpected /metrics response: code=%d", resp.StatusCode)
+	}
+}

@@ -6,7 +6,6 @@ scrape_configs:
     static_configs:
       - targets: ["server:8081"]
 
-  # Step 4 为 worker 接入独立 /metrics 端口后取消注释即可启用抓取
-  # - job_name: "evalreel-worker"
-  #   static_configs:
-  #     - targets: ["worker:8082"]
+  - job_name: "evalreel-worker"
+    static_configs:
+      - targets: ["worker:8082"]

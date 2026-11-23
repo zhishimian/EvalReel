@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
-	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"evalreel/internal/observability"
 	"evalreel/internal/scheduler"
 	"evalreel/internal/store"
 	"evalreel/internal/worker"
@@ -24,13 +27,37 @@ func runWorker(args []string) {
 	redisDB := fs.Int("redis-db", 0, "Redis 数据库编号")
 	concurrency := fs.Int("concurrency", 10, "单 Worker 节点并发协程数")
 	outputDir := fs.String("output-dir", envOrDefault("EVALREEL_OUTPUT_DIR", "./reports"), "HTML 战报输出目录")
+	metricsListen := fs.String("metrics-listen", envOrDefault("EVALREEL_METRICS_LISTEN", ""), "可选监控 /metrics HTTP 监听地址")
+	logFormat := fs.String("log-format", envOrDefault("EVALREEL_LOG_FORMAT", "text"), "日志格式: text|json")
+	logLevel := fs.String("log-level", envOrDefault("EVALREEL_LOG_LEVEL", "info"), "日志级别: debug|info|warn|error")
+	otelExporter := fs.String("otel-exporter", envOrDefault("EVALREEL_OTEL_EXPORTER", "none"), "OpenTelemetry 导出: none|stdout|otlp")
+	otelEndpoint := fs.String("otel-endpoint", envOrDefault("EVALREEL_OTEL_ENDPOINT", ""), "OTLP HTTP 收集端地址")
 	_ = fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := observability.NewLogger(observability.LogConfig{
+		Service: "evalreel-worker",
+		Format:  *logFormat,
+		Level:   *logLevel,
+	}, os.Stdout)
 	if *mysqlDSN == "" {
 		logger.Error("worker requires -mysql-dsn or EVALREEL_MYSQL_DSN")
 		os.Exit(1)
 	}
+
+	otelShutdown, otelErr := observability.InitTracer(context.Background(), observability.OTelConfig{
+		ServiceName: "evalreel-worker",
+		Exporter:    *otelExporter,
+		Endpoint:    *otelEndpoint,
+	})
+	if otelErr != nil {
+		logger.Error("init otel tracer failed", "err", otelErr)
+		os.Exit(1)
+	}
+	defer func() {
+		sdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = otelShutdown(sdCtx)
+	}()
 
 	st, err := store.NewMySQLStore(*mysqlDSN)
 	if err != nil {
@@ -51,6 +78,27 @@ func runWorker(args []string) {
 	}
 	defer redisCli.Close()
 
+	var metricsSrv *http.Server
+	if *metricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", observability.DefaultMetrics().Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		metricsSrv = &http.Server{
+			Addr:              *metricsListen,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Info("worker metrics server started", "addr", *metricsListen)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("worker metrics server stopped", "err", err)
+			}
+		}()
+	}
+
 	lim := scheduler.NewRedisLuaLimiter(redisCli, nil)
 	bus := scheduler.NewRedisProgressBus(redisCli)
 	defer bus.Close()
@@ -63,5 +111,10 @@ func runWorker(args []string) {
 	if err := proc.RunServer(ctx, *redisAddr, *redisPass, *redisDB); err != nil {
 		logger.Error("worker stopped with error", "err", err)
 		os.Exit(1)
+	}
+	if metricsSrv != nil {
+		sdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(sdCtx)
 	}
 }

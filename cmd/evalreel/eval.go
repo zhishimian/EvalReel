@@ -17,6 +17,7 @@ import (
 
 	"evalreel/internal/api"
 	"evalreel/internal/config"
+	"evalreel/internal/observability"
 	"evalreel/internal/report"
 	"evalreel/internal/runner"
 	"evalreel/internal/scheduler"
@@ -132,9 +133,26 @@ func runServe(args []string) {
 	redisAddr := fs.String("redis-addr", envOrDefault("EVALREEL_REDIS_ADDR", "127.0.0.1:6379"), "服务端模式 Redis 地址")
 	redisPass := fs.String("redis-password", envOrDefault("EVALREEL_REDIS_PASSWORD", ""), "服务端模式 Redis 密码")
 	redisDB := fs.Int("redis-db", 0, "服务端模式 Redis 数据库编号")
+	logFormat := fs.String("log-format", envOrDefault("EVALREEL_LOG_FORMAT", "text"), "日志格式: text|json")
+	logLevel := fs.String("log-level", envOrDefault("EVALREEL_LOG_LEVEL", "info"), "日志级别: debug|info|warn|error")
+	otelExporter := fs.String("otel-exporter", envOrDefault("EVALREEL_OTEL_EXPORTER", "none"), "OpenTelemetry 导出: none|stdout|otlp")
+	otelEndpoint := fs.String("otel-endpoint", envOrDefault("EVALREEL_OTEL_ENDPOINT", ""), "OTLP HTTP 收集端地址")
 	_ = fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := observability.NewLogger(observability.LogConfig{
+		Service: "evalreel-server",
+		Format:  *logFormat,
+		Level:   *logLevel,
+	}, os.Stdout)
+	otelShutdown, otelErr := observability.InitTracer(context.Background(), observability.OTelConfig{
+		ServiceName: "evalreel-server",
+		Exporter:    *otelExporter,
+		Endpoint:    *otelEndpoint,
+	})
+	if otelErr != nil {
+		logger.Error("init otel tracer failed", "err", otelErr)
+		os.Exit(1)
+	}
 
 	var (
 		st         store.Store
@@ -242,6 +260,7 @@ func runServe(args []string) {
 	defer cancel()
 	_ = srv.Shutdown(sdCtx)
 	apiSrv.Shutdown()
+	_ = otelShutdown(sdCtx)
 }
 
 func envOrDefault(key, fallback string) string {

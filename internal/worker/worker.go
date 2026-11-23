@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"evalreel/internal/config"
+	"evalreel/internal/observability"
 	"evalreel/internal/report"
 	"evalreel/internal/runner"
 	"evalreel/internal/scheduler"
@@ -155,9 +156,11 @@ func (p *Processor) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	}
 
 	if p.limiter != nil && tgt.RPM > 0 {
+		waitStart := time.Now()
 		if err := p.limiter.WaitFor(ctx, tgt.Name, tgt.RPM, 0); err != nil {
 			return err
 		}
+		observability.DefaultMetrics().ObserveLimiterWait(tgt.Name, time.Since(waitStart).Milliseconds())
 	}
 
 	retryCount, _ := asynq.GetRetryCount(ctx)
@@ -174,6 +177,13 @@ func (p *Processor) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	execCtx, cancelExec := context.WithTimeout(ctx, taskTimeout)
 	defer cancelExec()
 
+	spanCtx, span := observability.StartGenAISpan(execCtx, "evalreel.worker.execute", observability.GenAIAttrs{
+		System:       "openai",
+		RequestModel: tgt.Model,
+		RunID:        payload.RunID,
+		TaskID:       tk.ID,
+	})
+
 	var out runner.RunOutput
 	var execErr error
 	if cfg.Mode == "agent" {
@@ -181,15 +191,29 @@ func (p *Processor) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		if tgt.Agent != nil && tgt.Agent.Command != "" {
 			agentCfg = *tgt.Agent
 		}
-		out, execErr = runner.NewAgentRunner(agentCfg).Execute(execCtx, tgt, item)
+		out, execErr = runner.NewAgentRunner(agentCfg).Execute(spanCtx, tgt, item)
 	} else {
-		out, execErr = p.llmRunner.Execute(execCtx, tgt, item)
+		out, execErr = p.llmRunner.Execute(spanCtx, tgt, item)
 	}
 	if out.WorkDir != "" {
 		defer os.RemoveAll(out.WorkDir)
 	}
 
+	spanStatus := "ok"
 	if execErr != nil {
+		spanStatus = "error"
+	}
+	observability.EndGenAISpan(span, observability.GenAIResult{
+		ResponseModel: tgt.Model,
+		InputTokens:   out.InputTokens,
+		OutputTokens:  out.OutputTokens,
+		FinishReason:  out.FinishReason,
+		Status:        spanStatus,
+		Err:           execErr,
+	})
+
+	if execErr != nil {
+		observability.DefaultMetrics().RecordWorkerTask(tgt.Name, "error", out.TotalMs)
 		if ctx.Err() != nil {
 			return execErr
 		}
@@ -203,6 +227,9 @@ func (p *Processor) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		}
 		return execErr
 	}
+
+	observability.DefaultMetrics().RecordWorkerTask(tgt.Name, "success", out.TotalMs)
+	observability.DefaultMetrics().ObserveTTFT("worker", tgt.Model, "first_token", out.TTFTMs)
 
 	scorers, err := scorer.BuildScorers(cfg.Scorers)
 	if err != nil {

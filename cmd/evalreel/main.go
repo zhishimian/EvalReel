@@ -17,6 +17,7 @@ import (
 	"evalreel/internal/chaos"
 	"evalreel/internal/config"
 	"evalreel/internal/mockllm"
+	"evalreel/internal/observability"
 	"evalreel/internal/proxy"
 	"evalreel/internal/recorder"
 	"evalreel/internal/sse"
@@ -90,14 +91,32 @@ func runMockLLM(args []string) {
 }
 
 func runProxy(args []string) {
+	loadDotEnv(".env")
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "YAML 配置文件路径（留空则使用默认配置）")
 	listenOverride := fs.String("listen", "", "覆盖代理监听地址")
 	upstreamOverride := fs.String("upstream", "", "覆盖上游大模型地址")
 	outDirOverride := fs.String("out", "", "覆盖轨迹输出目录")
+	logFormat := fs.String("log-format", envOrDefault("EVALREEL_LOG_FORMAT", "text"), "日志格式: text|json")
+	logLevel := fs.String("log-level", envOrDefault("EVALREEL_LOG_LEVEL", "info"), "日志级别: debug|info|warn|error")
+	otelExporter := fs.String("otel-exporter", envOrDefault("EVALREEL_OTEL_EXPORTER", "none"), "OpenTelemetry 导出: none|stdout|otlp")
+	otelEndpoint := fs.String("otel-endpoint", envOrDefault("EVALREEL_OTEL_ENDPOINT", ""), "OTLP HTTP 收集端地址")
 	_ = fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := observability.NewLogger(observability.LogConfig{
+		Service: "evalreel-proxy",
+		Format:  *logFormat,
+		Level:   *logLevel,
+	}, os.Stdout)
+	otelShutdown, otelErr := observability.InitTracer(context.Background(), observability.OTelConfig{
+		ServiceName: "evalreel-proxy",
+		Exporter:    *otelExporter,
+		Endpoint:    *otelEndpoint,
+	})
+	if otelErr != nil {
+		logger.Error("init otel tracer failed", "err", otelErr)
+		os.Exit(1)
+	}
 
 	var cfg *config.Config
 	var err error
@@ -215,6 +234,7 @@ func runProxy(args []string) {
 	} else {
 		logger.Info("trace file finalized", "path", traceFile)
 	}
+	_ = otelShutdown(sdCtx)
 }
 
 func printUsage() {
