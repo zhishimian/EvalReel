@@ -187,6 +187,7 @@ func TestProxy_MidStreamClientCancel(t *testing.T) {
 	proxySrv := httptest.NewServer(p.Handler())
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxySrv.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"mock-reasoning-v1","stream":true,"messages":[{"role":"user","content":"cancel test"}]}`))
 	if err != nil {

@@ -62,6 +62,8 @@ func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder
 		cancel:   cancel,
 	}
 
+	r.GET("/", s.handleUI)
+
 	apiGroup := r.Group("/api")
 	apiGroup.GET("/health", s.handleHealth)
 	apiGroup.GET("/queues/stats", s.handleQueueStats)

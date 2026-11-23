@@ -391,6 +391,30 @@ func TestAPI_CompareEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPI_EmbeddedUI(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		httpSrv.Client().CloseIdleConnections()
+		httpSrv.Close()
+	}()
+
+	resp, err := httpSrv.Client().Get(httpSrv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	body := string(raw)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "EvalReel 轻量状态台") {
+		t.Fatalf("unexpected UI response: code=%d", resp.StatusCode)
+	}
+	if strings.Contains(body, "<script src=") || strings.Contains(body, "cdn.") {
+		t.Fatalf("embedded UI must not depend on external CDN scripts")
+	}
+}
+
 func TestAPI_IdempotencyKey(t *testing.T) {
 	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "idem_test.db"))
 	if err != nil {

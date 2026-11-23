@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EvalReel 控制台</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px auto; max-width: 1120px; padding: 0 16px; color: #1f2937; background: #f9fafb; }
+  h1, h2 { margin: 0 0 10px 0; }
+  .bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #e0f2fe; color: #0369a1; font-size: 13px; font-weight: 600; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 18px; }
+  textarea { width: 100%; min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; box-sizing: border-box; }
+  .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  button, a.btn { padding: 6px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; color: #111827; text-decoration: none; cursor: pointer; font-size: 13px; display: inline-block; }
+  button.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 6px; text-align: left; }
+  th { background: #f3f4f6; }
+  .progress-wrap { margin-top: 10px; display: none; }
+  .progress-bg { height: 10px; background: #e5e7eb; border-radius: 6px; overflow: hidden; }
+  .progress-fill { height: 10px; background: #10b981; width: 0%; transition: width 0.2s; }
+  .muted { color: #6b7280; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <h1>EvalReel 轻量状态台</h1>
+    <div id="queue-pill" class="pill">队列状态加载中</div>
+  </div>
+
+  <div class="card">
+    <h2>提交评测任务</h2>
+    <textarea id="cfg-input" placeholder="粘贴 eval.json 配置内容后点击提交"></textarea>
+    <div class="actions">
+      <button class="primary" onclick="submitRun()">提交评测</button>
+      <button onclick="refreshAll()">刷新状态</button>
+      <span id="submit-msg" class="muted"></span>
+    </div>
+    <div id="sse-box" class="progress-wrap">
+      <div id="sse-text" class="muted">等待进度事件</div>
+      <div class="progress-bg"><div id="sse-bar" class="progress-fill"></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="bar">
+      <h2>历史评测列表</h2>
+      <div class="actions">
+        <button class="primary" onclick="openCompare()">对比所选版本 (回归分析)</button>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:32px;">选</th>
+          <th>Run ID / 名称</th>
+          <th>模式</th>
+          <th>状态</th>
+          <th>进度 (成功/失败)</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="runs-body"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="bar">
+      <h2>死信队列 (Archived)</h2>
+      <button onclick="retryAllArchived()">重放全部死信</button>
+    </div>
+    <div id="archived-box" class="muted">暂无死信任务</div>
+  </div>
+
+  <script>
+    let activeES = null;
+    async function refreshAll() {
+      try {
+        const [qResp, rResp, aResp] = await Promise.all([
+          fetch('/api/queues/stats'),
+          fetch('/api/runs?limit=30'),
+          fetch('/api/queues/archived?limit=20')
+        ]);
+        if (qResp.ok) {
+          const q = await qResp.json();
+          document.getElementById('queue-pill').textContent =
+            '队列(' + (q.queue || 'local') + ') 等待:' + (q.pending||0) + ' 执行:' + (q.active||0) + ' 重试:' + (q.retry||0) + ' 死信:' + (q.archived||0);
+        }
+        if (rResp.ok) {
+          const data = await rResp.json();
+          renderRuns(data.runs || []);
+        }
+        if (aResp.ok) {
+          const arch = await aResp.json();
+          const list = arch.tasks || [];
+          document.getElementById('archived-box').textContent = list.length === 0
+            ? '暂无死信任务'
+            : list.map(t => t.id + ' (' + (t.last_err || 'error') + ')').join(' | ');
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function renderRuns(runs) {
+      const tbody = document.getElementById('runs-body');
+      tbody.innerHTML = runs.map(r => {
+        const done = r.done_tasks || 0;
+        const total = r.total_tasks || 0;
+        const failed = r.failed_tasks || 0;
+        return '<tr>' +
+          '<td><input type="checkbox" class="cmp-chk" value="' + r.id + '"></td>' +
+          '<td><code>' + r.id + '</code><div class="muted">' + (r.name || '') + '</div></td>' +
+          '<td>' + r.mode + '</td>' +
+          '<td>' + r.status + '</td>' +
+          '<td>' + done + ' / ' + total + ' (失败 ' + failed + ')</td>' +
+          '<td class="actions">' +
+            '<a class="btn" href="/api/runs/' + encodeURIComponent(r.id) + '/report" target="_blank">战报</a>' +
+            '<button onclick="retryFailed(\'' + r.id + '\')">重跑失败</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    async function submitRun() {
+      const msgEl = document.getElementById('submit-msg');
+      const raw = document.getElementById('cfg-input').value.trim();
+      if (!raw) { msgEl.textContent = '请先输入 JSON 配置'; return; }
+      const resp = await fetch('/api/runs', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: raw
+      });
+      const out = await resp.json();
+      if (!resp.ok) { msgEl.textContent = '提交失败: ' + (out.error || resp.status); return; }
+      msgEl.textContent = '已提交 ' + out.run_id;
+      watchProgress(out.run_id);
+      refreshAll();
+    }
+
+    function watchProgress(runID) {
+      if (activeES) activeES.close();
+      const wrap = document.getElementById('sse-box');
+      wrap.style.display = 'block';
+      activeES = new EventSource('/api/runs/' + encodeURIComponent(runID) + '/events');
+      activeES.addEventListener('progress', function(e) {
+        const ev = JSON.parse(e.data);
+        const pct = ev.total > 0 ? Math.round(100 * ev.done / ev.total) : 0;
+        document.getElementById('sse-bar').style.width = pct + '%';
+        document.getElementById('sse-text').textContent =
+          ev.run_id + ': ' + ev.done + '/' + ev.total + ' (失败 ' + ev.failed + ') [' + ev.status + ']';
+        if (ev.status === 'completed' || ev.status === 'failed' || ev.status === 'canceled') {
+          activeES.close();
+          refreshAll();
+        }
+      });
+    }
+
+    async function retryFailed(runID) {
+      const resp = await fetch('/api/runs/' + encodeURIComponent(runID) + '/retry-failed', {method: 'POST'});
+      const out = await resp.json();
+      document.getElementById('submit-msg').textContent = '已重置并重跑 ' + (out.retried_tasks || 0) + ' 条失败任务';
+      if ((out.retried_tasks || 0) > 0) watchProgress(runID);
+      refreshAll();
+    }
+
+    async function retryAllArchived() {
+      const resp = await fetch('/api/queues/archived/retry', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({all: true})
+      });
+      const out = await resp.json();
+      document.getElementById('submit-msg').textContent = '已重放死信任务数: ' + (out.retried_count || 0);
+      refreshAll();
+    }
+
+    function openCompare() {
+      const ids = Array.from(document.querySelectorAll('.cmp-chk:checked')).map(el => el.value);
+      if (ids.length < 2) {
+        document.getElementById('submit-msg').textContent = '请至少勾选 2 场评测用于回归对比';
+        return;
+      }
+      window.open('/api/compare?runs=' + encodeURIComponent(ids.join(',')), '_blank');
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 5000);
+  </script>
+</body>
+</html>
