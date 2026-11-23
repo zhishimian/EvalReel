@@ -7,3 +7,5 @@ configs/*.local.yaml
 .idea/
 *.out
 *.test
+__pycache__/
+*.pyc
