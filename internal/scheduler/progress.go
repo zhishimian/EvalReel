@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -16,6 +17,13 @@ type ProgressEvent struct {
 	Status     store.RunStatus `json:"status"`
 	LastTaskID string          `json:"last_task_id,omitempty"`
 	Timestamp  time.Time       `json:"timestamp"`
+}
+
+// ProgressBus 抽象跨进程进度发布与订阅接口；单机模式用内存广播，分布式模式用 Redis Pub/Sub。
+type ProgressBus interface {
+	PublishEvent(ctx context.Context, ev ProgressEvent) error
+	SubscribeEvents(ctx context.Context, runID string) (<-chan ProgressEvent, func(), error)
+	Close() error
 }
 
 // ProgressBroker 负责将调度进度非阻塞地广播给所有订阅同一场评测的客户端。
@@ -78,4 +86,26 @@ func (b *ProgressBroker) Publish(ev ProgressEvent) {
 		default:
 		}
 	}
+}
+
+// PublishEvent 实现 ProgressBus 接口。
+func (b *ProgressBroker) PublishEvent(_ context.Context, ev ProgressEvent) error {
+	b.Publish(ev)
+	return nil
+}
+
+// SubscribeEvents 实现 ProgressBus 接口。
+func (b *ProgressBroker) SubscribeEvents(_ context.Context, runID string) (<-chan ProgressEvent, func(), error) {
+	if b == nil {
+		ch := make(chan ProgressEvent)
+		close(ch)
+		return ch, func() {}, nil
+	}
+	ch, cancel := b.Subscribe(runID)
+	return ch, cancel, nil
+}
+
+// Close 实现 ProgressBus 接口。
+func (b *ProgressBroker) Close() error {
+	return nil
 }

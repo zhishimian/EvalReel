@@ -25,6 +25,7 @@ type Store interface {
 	TryFinalizeRun(ctx context.Context, runID string, finishedAt time.Time) (bool, error)
 	SaveScores(ctx context.Context, scores []EvalScore) error
 	GetRun(ctx context.Context, runID string) (*EvalRun, []EvalTask, []EvalScore, error)
+	GetRunMeta(ctx context.Context, runID string) (*EvalRun, error)
 	ListRuns(ctx context.Context, limit int) ([]EvalRun, error)
 	SaveReport(ctx context.Context, report *EvalReport) error
 	GetReport(ctx context.Context, runID string) (*EvalReport, error)

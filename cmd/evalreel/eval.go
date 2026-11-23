@@ -22,6 +22,8 @@ import (
 	"evalreel/internal/scheduler"
 	"evalreel/internal/scorer"
 	"evalreel/internal/store"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func runEval(args []string) {
@@ -121,34 +123,101 @@ func runEval(args []string) {
 }
 
 func runServe(args []string) {
+	loadDotEnv(".env")
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	listen := fs.String("listen", "127.0.0.1:8081", "Gin 控制面接口监听地址")
-	dbPath := fs.String("db", "./evalreel.db", "SQLite 数据库文件路径")
+	mode := fs.String("mode", envOrDefault("EVALREEL_MODE", "local"), "运行模式: local（单机 SQLite）或 server（MySQL + Redis 分布式）")
+	listen := fs.String("listen", envOrDefault("EVALREEL_LISTEN", "127.0.0.1:8081"), "Gin 控制面接口监听地址")
+	dbPath := fs.String("db", envOrDefault("EVALREEL_DB_PATH", "./evalreel.db"), "本地模式 SQLite 数据库文件路径")
+	mysqlDSN := fs.String("mysql-dsn", envOrDefault("EVALREEL_MYSQL_DSN", ""), "服务端模式 MySQL DSN")
+	redisAddr := fs.String("redis-addr", envOrDefault("EVALREEL_REDIS_ADDR", "127.0.0.1:6379"), "服务端模式 Redis 地址")
+	redisPass := fs.String("redis-password", envOrDefault("EVALREEL_REDIS_PASSWORD", ""), "服务端模式 Redis 密码")
+	redisDB := fs.Int("redis-db", 0, "服务端模式 Redis 数据库编号")
 	_ = fs.Parse(args)
 
-	loadDotEnv(".env")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	st, err := store.NewSQLiteStore(*dbPath)
-	if err != nil {
-		logger.Error("open sqlite failed", "err", err)
+	var (
+		st         store.Store
+		bus        scheduler.ProgressBus
+		launcher   api.RunLauncher
+		dispatcher *scheduler.AsynqDispatcher
+		redisCli   *redis.Client
+		err        error
+	)
+
+	switch *mode {
+	case "local":
+		st, err = store.NewSQLiteStore(*dbPath)
+		if err != nil {
+			logger.Error("open sqlite failed", "err", err)
+			os.Exit(1)
+		}
+		bus = scheduler.NewProgressBroker()
+		launcher = func(ctx context.Context, runID string, cfg *config.EvalConfig) {
+			if err := executeEvalRun(ctx, st, bus.(*scheduler.ProgressBroker), runID, cfg, logger); err != nil {
+				logger.Warn("background eval run stopped", "run_id", runID, "err", err)
+			}
+		}
+	case "server":
+		if *mysqlDSN == "" {
+			logger.Error("server mode requires -mysql-dsn or EVALREEL_MYSQL_DSN")
+			os.Exit(1)
+		}
+		st, err = store.NewMySQLStore(*mysqlDSN)
+		if err != nil {
+			logger.Error("open mysql failed", "err", err)
+			os.Exit(1)
+		}
+		redisCli = redis.NewClient(&redis.Options{
+			Addr:     *redisAddr,
+			Password: *redisPass,
+			DB:       *redisDB,
+		})
+		if err := redisCli.Ping(context.Background()).Err(); err != nil {
+			logger.Error("ping redis failed", "err", err)
+			_ = st.Close()
+			_ = redisCli.Close()
+			os.Exit(1)
+		}
+		bus = scheduler.NewRedisProgressBus(redisCli)
+		dispatcher = scheduler.NewAsynqDispatcher(*redisAddr, *redisPass, *redisDB)
+		launcher = func(ctx context.Context, runID string, cfg *config.EvalConfig) {
+			tasks, cErr := st.ClaimPendingTasks(ctx, runID)
+			if cErr != nil {
+				logger.Error("load pending tasks for dispatch failed", "run_id", runID, "err", cErr)
+				_ = st.UpdateRunStatus(context.Background(), runID, store.RunFailed)
+				return
+			}
+			if dErr := dispatcher.DispatchRun(ctx, runID, tasks, *cfg); dErr != nil {
+				logger.Error("dispatch tasks to asynq failed", "run_id", runID, "err", dErr)
+				_ = st.UpdateRunStatus(context.Background(), runID, store.RunFailed)
+			}
+		}
+	default:
+		logger.Error("unsupported serve mode (want local|server)", "mode", *mode)
 		os.Exit(1)
 	}
-	defer st.Close()
 
-	broker := scheduler.NewProgressBroker()
+	defer st.Close()
+	defer bus.Close()
+	if dispatcher != nil {
+		defer dispatcher.Close()
+	}
+	if redisCli != nil {
+		defer redisCli.Close()
+	}
+
 	apiSrv := api.NewServer(
 		st,
-		broker,
+		bus,
 		func(_ context.Context, runID string, cfg *config.EvalConfig) ([]store.EvalTask, error) {
 			return buildEvalTasks(runID, cfg)
 		},
-		func(ctx context.Context, runID string, cfg *config.EvalConfig) {
-			if err := executeEvalRun(ctx, st, broker, runID, cfg, logger); err != nil {
-				logger.Warn("background eval run stopped", "run_id", runID, "err", err)
-			}
-		},
+		launcher,
 	)
+	if dispatcher != nil {
+		apiSrv.SetQueueStatsProvider(dispatcher.GetQueueStats)
+	}
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -160,7 +229,7 @@ func runServe(args []string) {
 	defer stop()
 
 	go func() {
-		logger.Info("evalreel api server started", "addr", *listen, "db", *dbPath)
+		logger.Info("evalreel api server started", "mode", *mode, "addr", *listen)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("api server failed", "err", err)
 			os.Exit(1)
@@ -173,6 +242,13 @@ func runServe(args []string) {
 	defer cancel()
 	_ = srv.Shutdown(sdCtx)
 	apiSrv.Shutdown()
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func buildEvalTasks(runID string, cfg *config.EvalConfig) ([]store.EvalTask, error) {

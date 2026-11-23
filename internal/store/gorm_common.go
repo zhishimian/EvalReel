@@ -252,6 +252,18 @@ func (s *gormStore) GetRun(ctx context.Context, runID string) (*EvalRun, []EvalT
 	return &run, tasks, scores, nil
 }
 
+// GetRunMeta 仅读取评测总任务元信息（不拉取全量子任务行），供 Worker 快速解析配置与检查收口状态。
+func (s *gormStore) GetRunMeta(ctx context.Context, runID string) (*EvalRun, error) {
+	var run EvalRun
+	if err := s.db.WithContext(ctx).Where("id = ?", runID).First(&run).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get run meta: %w", err)
+	}
+	return &run, nil
+}
+
 // ListRuns 按创建时间倒序列出历史评测总任务。
 func (s *gormStore) ListRuns(ctx context.Context, limit int) ([]EvalRun, error) {
 	if limit <= 0 {

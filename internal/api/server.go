@@ -28,19 +28,20 @@ type RunLauncher func(ctx context.Context, runID string, cfg *config.EvalConfig)
 
 // Server 提供基于 Gin 的评测控制接口与 SSE 实时进度推送服务。
 type Server struct {
-	engine   *gin.Engine
-	store    store.Store
-	broker   *scheduler.ProgressBroker
-	builder  TaskBuilder
-	launcher RunLauncher
-	baseCtx  context.Context
-	cancel   context.CancelFunc
-	bgWG     sync.WaitGroup
-	runSeq   atomic.Uint64
+	engine     *gin.Engine
+	store      store.Store
+	broker     scheduler.ProgressBus
+	builder    TaskBuilder
+	launcher   RunLauncher
+	queueStats func(context.Context) (*scheduler.QueueStats, error)
+	baseCtx    context.Context
+	cancel     context.CancelFunc
+	bgWG       sync.WaitGroup
+	runSeq     atomic.Uint64
 }
 
 // NewServer 创建并挂载全部路由的 Gin API 服务实例。
-func NewServer(st store.Store, broker *scheduler.ProgressBroker, builder TaskBuilder, launcher RunLauncher) *Server {
+func NewServer(st store.Store, broker scheduler.ProgressBus, builder TaskBuilder, launcher RunLauncher) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -58,6 +59,7 @@ func NewServer(st store.Store, broker *scheduler.ProgressBroker, builder TaskBui
 
 	apiGroup := r.Group("/api")
 	apiGroup.GET("/health", s.handleHealth)
+	apiGroup.GET("/queues/stats", s.handleQueueStats)
 	apiGroup.POST("/runs", s.handleCreateRun)
 	apiGroup.GET("/runs", s.handleListRuns)
 	apiGroup.GET("/runs/:id", s.handleGetRun)
@@ -65,6 +67,11 @@ func NewServer(st store.Store, broker *scheduler.ProgressBroker, builder TaskBui
 	apiGroup.GET("/runs/:id/report", s.handleGetReport)
 
 	return s
+}
+
+// SetQueueStatsProvider 注入分布式任务队列状态查询回调（服务端模式下由 AsynqDispatcher 提供）。
+func (s *Server) SetQueueStatsProvider(fn func(context.Context) (*scheduler.QueueStats, error)) {
+	s.queueStats = fn
 }
 
 // Handler 返回标准 http.Handler 供 http.Server 或 httptest 挂载。
@@ -80,6 +87,19 @@ func (s *Server) Shutdown() {
 
 func (s *Server) handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (s *Server) handleQueueStats(c *gin.Context) {
+	if s.queueStats == nil {
+		c.JSON(http.StatusOK, scheduler.QueueStats{Queue: "local"})
+		return
+	}
+	stats, err := s.queueStats(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
 }
 
 func (s *Server) handleCreateRun(c *gin.Context) {
@@ -207,7 +227,12 @@ func (s *Server) handleRunEvents(c *gin.Context) {
 	var ch <-chan scheduler.ProgressEvent
 	var unsub func()
 	if s.broker != nil {
-		ch, unsub = s.broker.Subscribe(runID)
+		var subErr error
+		ch, unsub, subErr = s.broker.SubscribeEvents(c.Request.Context(), runID)
+		if subErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "subscribe events: " + subErr.Error()})
+			return
+		}
 		defer unsub()
 	}
 
