@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func openTestStore(t *testing.T) *SQLiteStore {
@@ -231,5 +233,109 @@ func TestSQLiteStore_ReportAndList(t *testing.T) {
 	_, err = st.GetReport(ctx, "missing-id")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestSQLiteStore_IdempotencyFinalizeGetTaskAndSpans(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+
+	// 多个不传幂等键（nil -> SQL NULL）的评测应当都能正常创建。
+	for i := 0; i < 2; i++ {
+		if err := st.CreateRun(ctx, &EvalRun{
+			ID:         fmt.Sprintf("run-null-%d", i),
+			Mode:       "benchmark",
+			Status:     RunRunning,
+			ConfigJSON: `{}`,
+			TotalTasks: 1,
+		}, nil); err != nil {
+			t.Fatalf("CreateRun nil key %d: %v", i, err)
+		}
+	}
+
+	k1 := "idem-sqlite-001"
+	if err := st.CreateRun(ctx, &EvalRun{
+		ID:             "run-idem-1",
+		IdempotencyKey: &k1,
+		Mode:           "benchmark",
+		Status:         RunRunning,
+		ConfigJSON:     `{}`,
+		TotalTasks:     2,
+	}, []EvalTask{
+		{ID: "tk-1", RunID: "run-idem-1", ItemID: "q1", TargetName: "m1", TrialIndex: 0, Status: TaskPending},
+		{ID: "tk-2", RunID: "run-idem-1", ItemID: "q2", TargetName: "m1", TrialIndex: 0, Status: TaskPending},
+	}); err != nil {
+		t.Fatalf("CreateRun with key: %v", err)
+	}
+
+	// 重复幂等键应当返回 ErrDuplicateKey。
+	err := st.CreateRun(ctx, &EvalRun{
+		ID:             "run-idem-dup",
+		IdempotencyKey: &k1,
+		Mode:           "benchmark",
+		Status:         RunRunning,
+		ConfigJSON:     `{}`,
+		TotalTasks:     1,
+	}, nil)
+	if !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("expected ErrDuplicateKey, got %v", err)
+	}
+
+	found, err := st.FindRunByIdempotencyKey(ctx, k1)
+	if err != nil || found.ID != "run-idem-1" {
+		t.Fatalf("FindRunByIdempotencyKey: run=%+v err=%v", found, err)
+	}
+	if _, err := st.FindRunByIdempotencyKey(ctx, "missing-key"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing key, got %v", err)
+	}
+
+	tk, err := st.GetTask(ctx, "tk-1")
+	if err != nil || tk.RunID != "run-idem-1" {
+		t.Fatalf("GetTask: tk=%+v err=%v", tk, err)
+	}
+	if _, err := st.GetTask(ctx, "missing-tk"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing task, got %v", err)
+	}
+
+	// 完成前 TryFinalizeRun 不能抢占收口。
+	_ = st.UpdateTaskResult(ctx, "tk-1", TaskResultUpdate{Status: TaskSuccess})
+	ok, err := st.TryFinalizeRun(ctx, "run-idem-1", time.Now())
+	if err != nil || ok {
+		t.Fatalf("expected TryFinalizeRun=false before all done, got ok=%v err=%v", ok, err)
+	}
+
+	_ = st.UpdateTaskResult(ctx, "tk-2", TaskResultUpdate{Status: TaskSuccess})
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, fErr := st.TryFinalizeRun(ctx, "run-idem-1", time.Now())
+			if fErr != nil {
+				t.Errorf("TryFinalizeRun: %v", fErr)
+				return
+			}
+			if won {
+				wins.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins.Load() != 1 {
+		t.Fatalf("expected exactly 1 finalize winner, got %d", wins.Load())
+	}
+
+	// SaveSpans 幂等覆盖与 ListSpansByTraceID 排序验证。
+	spans := []TraceSpan{
+		{SpanID: "sp-2", ParentSpanID: "sp-1", TraceID: "tr-multi-1", RunID: "run-idem-1", TaskID: "tk-1", AgentName: "coder", StartTimeMs: 200, DurationMs: 50, Status: "ok"},
+		{SpanID: "sp-1", TraceID: "tr-multi-1", RunID: "run-idem-1", TaskID: "tk-1", AgentName: "planner", StartTimeMs: 100, DurationMs: 200, Status: "ok"},
+	}
+	if err := st.SaveSpans(ctx, spans); err != nil {
+		t.Fatalf("SaveSpans: %v", err)
+	}
+	gotSpans, err := st.ListSpansByTraceID(ctx, "tr-multi-1")
+	if err != nil || len(gotSpans) != 2 || gotSpans[0].SpanID != "sp-1" || gotSpans[1].SpanID != "sp-2" {
+		t.Fatalf("ListSpansByTraceID: spans=%+v err=%v", gotSpans, err)
 	}
 }

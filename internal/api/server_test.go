@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -260,5 +262,91 @@ func TestAPI_ReportDownload(t *testing.T) {
 	body, _ := io.ReadAll(r200.Body)
 	if r200.StatusCode != http.StatusOK || !strings.Contains(string(body), "EvalReel Report") {
 		t.Fatalf("unexpected report response: code=%d body=%s", r200.StatusCode, string(body))
+	}
+}
+
+func TestAPI_IdempotencyKey(t *testing.T) {
+	st, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "idem_test.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	var launchCount atomic.Int32
+	srv := NewServer(
+		st,
+		scheduler.NewProgressBroker(),
+		func(_ context.Context, runID string, _ *config.EvalConfig) ([]store.EvalTask, error) {
+			return []store.EvalTask{{ID: runID + "-t0", RunID: runID, ItemID: "i0", TargetName: "m1", Status: store.TaskPending}}, nil
+		},
+		func(_ context.Context, _ string, _ *config.EvalConfig) {
+			launchCount.Add(1)
+		},
+	)
+	t.Cleanup(func() {
+		srv.Shutdown()
+		_ = st.Close()
+	})
+
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer func() {
+		httpSrv.Client().CloseIdleConnections()
+		httpSrv.Close()
+	}()
+
+	payload := `{"name":"idem-test","mode":"benchmark","targets":[{"name":"m1","base_url":"http://127.0.0.1:9090/v1","model":"m1"}]}`
+	postWithKey := func(key string) (int, string, bool) {
+		req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/runs", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		resp, err := httpSrv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("POST failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			RunID            string `json:"run_id"`
+			IdempotentReplay bool   `json:"idempotent_replay"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body.RunID, body.IdempotentReplay
+	}
+
+	// 1. 同一个幂等键首次提交返回 202，重放返回 200 并复用同一 run_id。
+	c1, id1, r1 := postWithKey("ci-req-123")
+	if c1 != http.StatusAccepted || id1 == "" || r1 {
+		t.Fatalf("first request unexpected: code=%d id=%s replay=%v", c1, id1, r1)
+	}
+	c2, id2, r2 := postWithKey("ci-req-123")
+	if c2 != http.StatusOK || id2 != id1 || !r2 {
+		t.Fatalf("replay request unexpected: code=%d id=%s want=%s replay=%v", c2, id2, id1, r2)
+	}
+
+	// 2. 并发重放同一个幂等键时只会启动一次。
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			code, runID, _ := postWithKey("ci-conc-456")
+			if code != http.StatusAccepted && code != http.StatusOK {
+				t.Errorf("unexpected status code %d", code)
+			}
+			if runID == "" {
+				t.Errorf("empty run_id")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 3. 不带幂等键的两次请求必须创建两个不同的 run_id。
+	_, noKey1, _ := postWithKey("")
+	_, noKey2, _ := postWithKey("")
+	if noKey1 == "" || noKey2 == "" || noKey1 == noKey2 {
+		t.Fatalf("expected distinct run ids without idempotency key, got %q and %q", noKey1, noKey2)
+	}
+
+	if launchCount.Load() != 4 {
+		t.Fatalf("expected exactly 4 launched runs (2 keyed + 2 unkeyed), got %d", launchCount.Load())
 	}
 }

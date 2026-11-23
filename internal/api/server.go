@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +94,24 @@ func (s *Server) handleCreateRun(c *gin.Context) {
 		return
 	}
 
+	idemKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idemKey != "" {
+		existing, err := s.store.FindRunByIdempotencyKey(c.Request.Context(), idemKey)
+		if err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"run_id":            existing.ID,
+				"status":            existing.Status,
+				"total_tasks":       existing.TotalTasks,
+				"idempotent_replay": true,
+			})
+			return
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "check idempotency key: " + err.Error()})
+			return
+		}
+	}
+
 	runID := fmt.Sprintf("run_%d_%d", time.Now().UnixMilli(), s.runSeq.Add(1))
 	var tasks []store.EvalTask
 	var err error
@@ -113,8 +132,22 @@ func (s *Server) handleCreateRun(c *gin.Context) {
 		ConfigJSON: string(cfgBytes),
 		TotalTasks: len(tasks),
 	}
+	if idemKey != "" {
+		run.IdempotencyKey = &idemKey
+	}
 
 	if err := s.store.CreateRun(c.Request.Context(), run, tasks); err != nil {
+		if errors.Is(err, store.ErrDuplicateKey) && idemKey != "" {
+			if existing, fErr := s.store.FindRunByIdempotencyKey(c.Request.Context(), idemKey); fErr == nil {
+				c.JSON(http.StatusOK, gin.H{
+					"run_id":            existing.ID,
+					"status":            existing.Status,
+					"total_tasks":       existing.TotalTasks,
+					"idempotent_replay": true,
+				})
+				return
+			}
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "save run: " + err.Error()})
 		return
 	}
